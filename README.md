@@ -68,8 +68,10 @@ devcontainer exec --workspace-folder . cargo build --release
     "path": "/opt/hooks/pce_hook",
     "env": ["PCE_INPUT=/etc/hooks/pce-input.json"]
   },
-  "when": { "always": true },
-  "stages": ["createContainer"]
+  "when": {
+    "always": false,
+    "annotations": { "pce.enable": "^true$" }
+  },  "stages": ["createContainer"]
 }
 ```
 
