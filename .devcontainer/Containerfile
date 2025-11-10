@@ -1,0 +1,45 @@
+FROM alpine:3.20
+
+# Base build deps
+RUN apk add --no-cache \
+    bash curl git jq ca-certificates \
+    build-base musl-dev pkgconf \
+    openssl-dev openssl-libs-static zlib-dev zlib-static \
+    bats
+
+# Install Rust
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+ARG RUST_VERSION=1.81.0
+RUN curl -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal \
+    && rustup component add rustfmt clippy rust-analyzer \
+    && rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+# Default env for static linking
+ENV CARGO_PROFILE_RELEASE_LTO=fat \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
+    CARGO_PROFILE_RELEASE_STRIP=true \
+    PKG_CONFIG_ALL_STATIC=1 \
+    OPENSSL_STATIC=1
+
+
+# Build args will come from devcontainer.json
+ARG USERNAME
+ARG USER_UID=1000
+ARG USER_GID=1000
+
+# Create group and user to help devpod integration on remote ssh provider, force a home for vscode too
+RUN addgroup -g ${USER_GID} ${USERNAME} \
+ && adduser -D -h /home/${USERNAME} -s /bin/bash -G ${USERNAME} -u ${USER_UID} ${USERNAME} \
+ && mkdir -p /home/${USERNAME} \
+ && chown -R ${USER_UID}:${USER_GID} /home/${USERNAME}
+
+# Ensure VS Code dirs exist and are owned by your user
+RUN mkdir -p /home/${USERNAME}/.vscode-server/{extensions,data/User} \
+ && chown -R ${USER_UID}:${USER_GID} /home/${USERNAME}
+
+# force HOME is set
+ENV HOME=/home/${USERNAME}
+

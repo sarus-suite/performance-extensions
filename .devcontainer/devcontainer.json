@@ -1,0 +1,47 @@
+{
+  "name": "rust-musl-build",
+  "build": {
+    "dockerfile": "Containerfile",
+    "context": "..",
+    "args": {
+      "USERNAME": "${localEnv:USER}",
+      "USER_UID": "${localEnv:UID:1000}",
+      "USER_GID": "${localEnv:GID:1000}"
+    }
+  },
+  // force set HOME env var
+  "containerEnv": {
+    "HOME": "/home/${localEnv:USER}"
+  },
+  // Use the user we setup con build
+//  "remoteUser": "${localEnv:USER}",
+  // use Containerfile UID/GID match
+  "updateRemoteUserUID": false,
+  // prevent devpod use of `--userns=keep-id`
+  "runArgs": ["--userns=host"],
+  // fix vscode dir premission detail
+  //"onCreateCommand": "sh -lc 'mkdir -p \"$HOME/.vscode-server/{extensions,data/User}\"; command -v sudo >/dev/null 2>&1 && sudo chown -R $(id -u):$(id -g) \"$HOME/.vscode-server\" || true'",
+
+  // Use podman named volumes as caches
+  "mounts": [
+    "type=volume,source=cargo-registry,target=/usr/local/cargo/registry",
+    "type=volume,source=cargo-git,target=/usr/local/cargo/git",
+    "type=volume,source=rustup,target=/usr/local/rustup"
+  ],
+  "customizations": {
+    // tests vscode integrations
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "fill-labs.dependi",
+        "ms-azuretools.vscode-docker",
+        "ms-azuretools.vscode-containers"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy",
+        "editor.formatOnSave": true
+      }
+    }
+  }
+}

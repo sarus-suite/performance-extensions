@@ -1,0 +1,11 @@
+{
+  "precreate": "0.1.0",
+  "containerEdits": [
+    {
+      "env": [
+        "FOO=VALID_SPEC",
+        123456
+      ]
+    }
+  ]
+}

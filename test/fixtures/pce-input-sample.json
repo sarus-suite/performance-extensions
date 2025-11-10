@@ -1,0 +1,21 @@
+{
+  "precreate": "0.1.0",
+  "containerEdits": [
+    {
+      "env": [
+        "FOO=VALID_SPEC",
+        "BAR=BARVALUE1"
+      ],
+      "mounts": [
+        {"hostPath":"/bin/vendorBin","containerPath":"/bin/vendorBin"},
+        {"hostPath":"/usr/lib/libVendor.so.0","containerPath":"/usr/lib/libVendor.so.0"},
+        {
+          "hostPath":"tmpfs",
+          "containerPath":"/tmp/data",
+          "type":"tmpfs",
+          "options":["nosuid","strictatime","mode=755","size=65536k"]
+        }
+      ]
+    }
+  ]
+}

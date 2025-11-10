@@ -1,0 +1,25 @@
+{
+  "hello": "world",
+  "mounts": [
+    {
+      "containerPath": "/bin/vendorBin",
+      "hostPath": "/bin/vendorBin"
+    },
+    {
+      "containerPath": "/usr/lib/libVendor.so.0",
+      "hostPath": "/usr/lib/libVendor.so.0"
+    },
+    {
+      "containerPath": "/tmp/data",
+      "hostPath": "tmpfs",
+      "options": [
+        "nosuid",
+        "strictatime",
+        "mode=755",
+        "size=65536k"
+      ],
+      "type": "tmpfs"
+    }
+  ],
+  "n": 42
+}

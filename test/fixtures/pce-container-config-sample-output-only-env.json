@@ -1,0 +1,10 @@
+{
+  "hello": "world",
+  "n": 42,
+  "process": {
+    "env": [
+      "FOO=VALID_SPEC",
+      "BAR=BARVALUE1"
+	]
+  }
+}

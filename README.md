@@ -1,0 +1,83 @@
+# Sarus-suite Performance extensions — HPC features for Podman
+
+Extensions that turn Podman into an HPC-ready runtime with Sarus-suite.
+Annotation-driven. Fully static binaries. Works on any Linux node.
+
+---
+
+## Why it matters
+
+* **Accelerators on demand:** Enable accelerated libraries, MPS, extra mounts, env tweaks — per container — via annotations.
+* **Cluster-friendly:** Static builds = zero runtime deps. Drop the binaries onto heterogeneous systems.
+* **Least surprise:** Control hook execution from the Sarus EDF via annotation conditions match. No image changes needed.
+
+---
+
+## Hooks (quick)
+
+* **`pce_hook`** — *Precreate Container Edits*.
+  Reads container config from `stdin`, applies env + mount edits from `PCE_INPUT`, writes updated config to `stdout`. Use at `createContainer`.
+
+* **`ldcache_hook`** — *Refresh loader cache*.
+  On `prestart`, runs `ldconfig -v -r <rootfs>` (override with `LDCONFIG_PATH`).
+
+* **`mps_hook`** — *NVIDIA MPS bootstrap*.
+  Starts `nvidia-cuda-mps-control -d`, checks per-UID server, returns helpful exit codes.
+
+---
+
+## Build
+
+**Fast (native):**
+
+```bash
+cargo build --release
+```
+
+**Portable (recommended):** static `musl` builds via devcontainer
+```bash
+devcontainer up --workspace-folder .
+devcontainer exec --workspace-folder . cargo build --release
+```
+> Needs "devcontainer cli"
+
+---
+
+## Configure (OCI schema)
+
+**Example — ldconfig at prestart**
+
+```json
+{
+  "version": "1.0.0",
+  "hook": {
+    "path": "/opt/hooks/ldcache_hook",
+    "env": ["LDCONFIG_PATH=/sbin/ldconfig"]
+  },
+  "when": { "annotations": { "ldcache.enable": "true" } },
+  "stages": ["prestart"]
+}
+```
+
+**Example — PCE at createContainer**
+
+```json
+{
+  "version": "1.0.0",
+  "hook": {
+    "path": "/opt/hooks/pce_hook",
+    "env": ["PCE_INPUT=/etc/hooks/pce-input.json"]
+  },
+  "when": { "always": true },
+  "stages": ["createContainer"]
+}
+```
+
+---
+
+## Tests
+
+```bash
+bats test
+```
+

@@ -1,0 +1,16 @@
+{
+  "version": "1.0.0",
+  "hook": {
+    "path": "/tmp/felipecr/hooks/ldcache_hook",
+    "env": [
+      "LDCONFIG_PATH=/sbin/ldconfig"
+    ]
+  },
+  "when": {
+    "annotations": {
+      "ldcache.enable": "true"
+    }
+  },
+  "stages": ["prestart"]
+}
+
