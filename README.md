@@ -1,4 +1,4 @@
-# Sarus-suite Performance extensions — HPC features for Podman
+# Performance extensions — HPC features for Podman
 
 Extensions that turn Podman into an HPC-ready runtime with Sarus-suite.
 Annotation-driven. Fully static binaries. Works on any Linux node.
