@@ -52,7 +52,7 @@ Add a createContainer hook entry similar to:
   },
   "when": {
     "always": false,
-    "annotations": { "com.example.pce": "^true$" }
+    "annotations": { "pce.enable": "^true$" }
   },
   "stages": ["createContainer"]
 }
