@@ -3,7 +3,7 @@
 Extensions that turn Podman into an HPC-ready runtime with Sarus-suite.
 Annotation-driven. Fully static binaries. Works on any Linux node.
 
----
+
 
 ## Why it matters
 
@@ -11,7 +11,7 @@ Annotation-driven. Fully static binaries. Works on any Linux node.
 * **Cluster-friendly:** Static builds = zero runtime deps. Drop the binaries onto heterogeneous systems.
 * **Least surprise:** Control hook execution from the Sarus EDF via annotation conditions match. No image changes needed.
 
----
+
 
 ## Hooks (quick)
 
@@ -24,7 +24,7 @@ Annotation-driven. Fully static binaries. Works on any Linux node.
 * **`mps_hook`** — *NVIDIA MPS bootstrap*.
   Starts `nvidia-cuda-mps-control -d`, checks per-UID server, returns helpful exit codes.
 
----
+
 
 ## Build
 
@@ -41,7 +41,7 @@ devcontainer exec --workspace-folder . cargo build --release
 ```
 > Needs "devcontainer cli"
 
----
+
 
 ## Configure (OCI schema)
 
@@ -73,7 +73,7 @@ devcontainer exec --workspace-folder . cargo build --release
 }
 ```
 
----
+
 
 ## Tests
 
