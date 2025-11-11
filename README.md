@@ -13,22 +13,22 @@ Annotation-driven. Fully static binaries. Works on any Linux node.
 
 
 
-## Hooks (quick)
+## Hooks
 
-* **`pce_hook`** — *Precreate Container Edits*.
+* *Precreate Container Edits* [(pce_hook)](https://github.com/sarus-suite/performance-extensions/tree/main/crates/pce_hook)
   Reads container config from `stdin`, applies env + mount edits from `PCE_INPUT`, writes updated config to `stdout`. Use at `createContainer`.
 
-* **`ldcache_hook`** — *Refresh loader cache*.
+* *Refresh loader cache* [(ldcache_hook)](https://github.com/sarus-suite/performance-extensions/tree/main/crates/ldcache_hook)
   On `prestart`, runs `ldconfig -v -r <rootfs>` (override with `LDCONFIG_PATH`).
 
-* **`mps_hook`** — *NVIDIA MPS bootstrap*.
+* *NVIDIA MPS bootstrap* [(mps_hook)](https://github.com/sarus-suite/performance-extensions/tree/main/crates/mps_hook)
   Starts `nvidia-cuda-mps-control -d`, checks per-UID server, returns helpful exit codes.
 
 
 
 ## Build
 
-**Fast (native):**
+**Fast:**
 
 ```bash
 cargo build --release
@@ -43,9 +43,9 @@ devcontainer exec --workspace-folder . cargo build --release
 
 
 
-## Configure (OCI schema)
+## Configure (OCI hook schema)
 
-**Example — ldconfig at prestart**
+**Example: ldconfig at prestart**
 
 ```json
 {
@@ -59,7 +59,7 @@ devcontainer exec --workspace-folder . cargo build --release
 }
 ```
 
-**Example — PCE at createContainer**
+**Example: PCE at createContainer**
 
 ```json
 {
