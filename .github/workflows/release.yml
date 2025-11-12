@@ -1,0 +1,85 @@
+name: release (use devcontainer + cached)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:            # run manually from the Actions tab
+    inputs:
+      ref:
+        description: "Git ref (branch, tag, or SHA) to build"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-and-release:
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # for manual trigger
+          ref: ${{ inputs.ref != '' && inputs.ref || github.ref_name }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prebuild devcontainer
+        uses: devcontainers/ci@v0.3
+        with:
+          imageName: ghcr.io/${{ github.repository }}/devcontainer-${{ matrix.arch }}
+          cacheFrom: ghcr.io/${{ github.repository }}/devcontainer-${{ matrix.arch }}
+          push: always
+
+      - name: Build in Dev Container
+        uses: devcontainers/ci@v0.3
+        with:
+          imageName: ghcr.io/${{ github.repository }}/devcontainer-${{ matrix.arch }}
+          cacheFrom: ghcr.io/${{ github.repository }}/devcontainer-${{ matrix.arch }}
+          push: never
+          runCmd: |
+            bash -lc '
+              cargo build --release
+              cp target/release/ldcache_hook "target/release/ldcache_hook-${{ matrix.arch }}"
+              cp target/release/pce_hook "target/release/pce_hook-${{ matrix.arch }}"
+              cp target/release/mps_hook "target/release/mps_hook-${{ matrix.arch }}"
+              ls -lah target/release/
+            '
+
+      # Keep CI artifact
+      - name: Upload build ldcache
+        uses: actions/upload-artifact@v4
+        with:
+          name: ldcache_hook-${{ github.ref_name }}-${{ matrix.arch }}
+          path: target/release/ldcache_hook-${{ matrix.arch }}
+          if-no-files-found: error
+
+      - name: Upload build pce
+        uses: actions/upload-artifact@v4
+        with:
+          name: pce_hook-${{ github.ref_name }}-${{ matrix.arch }}
+          path: target/release/pce_hook-${{ matrix.arch }}
+          if-no-files-found: error
+
+      - name: Upload build mps
+        uses: actions/upload-artifact@v4
+        with:
+          name: mps_hook-${{ github.ref_name }}-${{ matrix.arch }}
+          path: target/release/mps_hook-${{ matrix.arch }}
+          if-no-files-found: error
+
