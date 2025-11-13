@@ -11,7 +11,7 @@ Make simple, declarative edits to an OCI container config at **createContainer**
 
 ## Input configuration file
 
-Minimal, CDI-like shape.
+Minimal, CDI-like shape
 
 ```json
 {
