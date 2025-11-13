@@ -58,3 +58,23 @@ Add a createContainer hook entry similar to:
 }
 ```
 
+### Controlling when the hook runs
+
+The hook is configured following the standard OCI hook, control of when it runs can be controlled with the `when` block in the hook JSON config. The fields in the `when` block are evaluated as a logical AND and must match for the hook to run.
+
+One way to control execution is by annotation mathing. So only will execute when a specific annotation is present for the container to hook to run (this can be controlled by the EDF). Example
+
+```json
+  "when": {
+    "annotations": { "pce.enable": "^true$" }
+  }
+```
+In this case the value is matched using regex, so it only matched literal `true`. Note that any regex expression can be used here.
+
+For having the hook to always run
+```json
+  "when": {
+    "always": true
+  }
+```
+For detailed explanation see the documentation [oci-hooks](https://github.com/containers/common/blob/main/pkg/hooks/docs/oci-hooks.5.md#100-hook-schema)
