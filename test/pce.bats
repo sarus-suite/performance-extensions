@@ -8,7 +8,7 @@ setup() {
 }
 
 
-@test "PCE hook modify input container config" {
+@test "PCE hook operates with ContainerEdits" {
   fixture="$repo/test/fixtures/container-config-sample.json"
   fixture_output="$repo/test/fixtures/container-config-sample-output-pce.json"
   PCE_INPUT="$repo/test/fixtures/pce-input-sample.json"
