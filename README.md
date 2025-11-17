@@ -59,7 +59,7 @@ devcontainer exec --workspace-folder . cargo build --release
 }
 ```
 
-**Example: PCE at createContainer**
+**Example: PCE at precreate stage**
 
 ```json
 {
