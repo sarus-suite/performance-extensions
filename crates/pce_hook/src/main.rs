@@ -152,16 +152,44 @@ fn ensure_obj<'a>(
 }
 
 
+// Manual write of mount block as cdi and container config formats dont match
 fn append_mounts(obj: &mut Map<String, Value>, mounts_to_add: Vec<Mount>) -> Result<(), String> {
     let mounts = ensure_array_field(obj, "mounts")?;
 
-    // mount entries just get added, no special logic
     for m in mounts_to_add {
-        mounts.push(serde_json::to_value(m).map_err(|e| format!("Failed to serialize mount: {e}"))?);
+        // Map input hostPath/containerPath → OCI source/destination
+        let mut out = Map::new();
+        out.insert("destination".to_string(), Value::String(m.container_path));
+
+        if let Some(t) = m.r#type {
+            out.insert("type".to_string(), Value::String(t));
+        }
+
+        out.insert("source".to_string(), Value::String(m.host_path));
+
+        if let Some(opts) = m.options {
+            out.insert(
+                "options".to_string(),
+                Value::Array(opts.into_iter().map(Value::String).collect()),
+            );
+        }
+
+        mounts.push(Value::Object(out));
     }
 
     Ok(())
 }
+
+//fn append_mounts(obj: &mut Map<String, Value>, mounts_to_add: Vec<Mount>) -> Result<(), String> {
+//    let mounts = ensure_array_field(obj, "mounts")?;
+//
+//    // mount entries just get added, no special logic
+//    for m in mounts_to_add {
+//        mounts.push(serde_json::to_value(m).map_err(|e| format!("Failed to serialize mount: {e}"))?);
+//    }
+//
+//    Ok(())
+//}
 
 
 fn ensure_array_field<'a>(
