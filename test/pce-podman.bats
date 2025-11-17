@@ -26,10 +26,11 @@ make_pce_hook_dir() {
     "env": [ "PCE_INPUT=$pce_input" ]
   },
   "when": {
-    "always": false,
-    "annotations": { "pce.enable": "^true$" }
+    "annotations": {
+      "pce.enabled": "true"
+    }
   },
-  "stages": ["createContainer"]
+  "stages": ["precreate"]
 }
 EOF
 
@@ -58,8 +59,10 @@ EOF
       ],
       "mounts": [
         {
+          "containerPath": "/pce-from-hook",
           "hostPath": "$mount_src",
-          "containerPath": "/pce-from-hook"
+          "type": "bind",
+          "options" : ["rw", "rbind"]
         }
       ]
     }
@@ -72,18 +75,16 @@ EOF
 
   # Run with hook DISABLED: env + mount should NOT be present
   run podman --hooks-dir="$hooks_dir" run --rm \
-    --annotation pce.enable=false \
+    --annotation pce.enabled=false \
     "$IMAGE" bash -lc '
       [ -z "${PCE_TEST_FOO:-}" ] &&
       [ -z "${PCE_TEST_MARKER:-}" ] &&
-      [ ! -d /pce-from-hook ]
-    '
+      [ ! -d /pce-from-hook ]'
 
-  [ "$status" -eq 0 ]
+   [ "$status" -eq 0 ]
 
   # Run with hook ENABLED: env + mount should be present
-  run podman --hooks-dir="$hooks_dir" run --rm \
-    --annotation pce.enable=true \
+  run podman --hooks-dir="$hooks_dir" run --rm --annotation pce.enabled="true" \
     "$IMAGE" bash -lc '
       [ "$PCE_TEST_FOO" = "BAR" ] &&
       [ "$PCE_TEST_MARKER" = "present" ] &&
@@ -91,10 +92,10 @@ EOF
       [ -f /pce-from-hook/marker ]
     '
 
-#  {
-#    printf '%s\n' "$output"
-#    printf '%s\n' "$stderr"
-#  } >&3
+  {
+    printf '%s\n' $stdout
+    printf '%s\n' $stderr
+  } >&3
 
   [ "$status" -eq 0 ]
 
