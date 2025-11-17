@@ -71,7 +71,7 @@ devcontainer exec --workspace-folder . cargo build --release
   "when": {
     "always": false,
     "annotations": { "pce.enable": "^true$" }
-  },  "stages": ["createContainer"]
+  },  "stages": ["precreate"]
 }
 ```
 
