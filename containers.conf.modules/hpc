@@ -1,0 +1,16 @@
+[containers]
+ipcns = "host"
+netns = "host"
+pidns = "host"
+utsns = "host"
+userns = "keep-id"
+cgroupns = "host"
+cgroups = "no-conmon"
+
+tz = "local"
+
+# Mounting /tmp as short term approach for basic pmi support
+mounts = ["type=bind,src=/tmp,dst=/tmp"]
+
+[engine]
+runtime = "crun"
