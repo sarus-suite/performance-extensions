@@ -25,16 +25,7 @@ fn run() -> Result<(), String> {
     let mut value = read_stdin_json()?;
     let obj = ensure_obj(value.as_object_mut(), "top-level JSON must be an object")?;
 
-    //let env_entries_raw = vec![String::from("HOME=/stikazzi")];
     let env_entries_raw = vec![get_home_env_entry(obj)?];
-
-    /*
-    let (mounts_to_add, env_entries_raw) = read_pce_input()?;
-
-    if !mounts_to_add.is_empty() {
-        append_mounts(obj, mounts_to_add)?;
-    }
-    */
 
     // Validate env entries and merge as strings
     let env_entries = validate_env_strings(env_entries_raw)?;
