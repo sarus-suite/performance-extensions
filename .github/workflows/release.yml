@@ -58,6 +58,7 @@ jobs:
               cp target/release/ldcache_hook "target/release/ldcache_hook-${{ matrix.arch }}"
               cp target/release/pce_hook "target/release/pce_hook-${{ matrix.arch }}"
               cp target/release/mps_hook "target/release/mps_hook-${{ matrix.arch }}"
+              cp target/release/mkhomedir "target/release/mkhomedir-${{ matrix.arch }}"
               ls -lah target/release/
             '
 
