@@ -91,7 +91,7 @@ struct HookInputs {
     primary_libs: Vec<Library>,
     dependency_libs: Vec<Library>,
     extra_files: Vec<PathBuf>,
-    compatibility_policy: CompatibilityPolicy,
+    _compatibility_policy: CompatibilityPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -187,7 +187,7 @@ fn load_inputs(config: &Value) -> Result<HookInputs> {
         primary_libs: parse_required_library_list("INJECTION_PRIMARY_LIBS")?,
         dependency_libs: parse_optional_library_list("INJECTION_DEPENDENCY_LIBS")?,
         extra_files: parse_optional_path_list("INJECTION_EXTRA_FILES"),
-        compatibility_policy: CompatibilityPolicy::from_env("INJECTION_COMPATIBILITY")?,
+        _compatibility_policy: CompatibilityPolicy::from_env("INJECTION_COMPATIBILITY")?,
     })
 }
 
@@ -306,40 +306,6 @@ impl Library {
         self.linker_name == other.linker_name && self.abi.major == other.abi.major
     }
 
-    fn is_full_compatible_with(&self, other: &Self) -> bool {
-        self.is_major_compatible_with(other) && self.abi.minor >= other.abi.minor
-    }
-
-    fn is_strict_compatible_with(&self, other: &Self) -> bool {
-        self.is_major_compatible_with(other) && self.abi.minor == other.abi.minor
-    }
-
-    fn pick_best_candidate<'a>(&self, candidates: &'a [Library]) -> Option<&'a Library> {
-        if candidates.is_empty() {
-            return None;
-        }
-
-        if let Some(exact) = candidates
-            .iter()
-            .find(|candidate| candidate.real_name == self.real_name)
-        {
-            return Some(exact);
-        }
-
-        let host_key = self.version_key();
-        let older_or_equal = candidates
-            .iter()
-            .filter(|candidate| candidate.version_key() <= host_key)
-            .max_by_key(|candidate| candidate.version_key());
-        if older_or_equal.is_some() {
-            return older_or_equal;
-        }
-
-        candidates
-            .iter()
-            .min_by_key(|candidate| candidate.version_key())
-    }
-
     fn link_chain_names(file_name: &str) -> Result<Vec<String>> {
         let (linker_name, abi, _) = parse_library_name(file_name)?;
         let mut names = vec![linker_name];
@@ -352,10 +318,6 @@ impl Library {
             names.push(next);
         }
         Ok(names)
-    }
-
-    fn version_key(&self) -> (Option<u32>, Option<u32>, Option<u32>) {
-        (self.abi.major, self.abi.minor, self.abi.patch)
     }
 }
 
@@ -459,12 +421,6 @@ fn parse_component(component: &str) -> Result<Option<u32>> {
 }
 
 fn discover_container_libraries(inputs: &HookInputs) -> Result<DiscoveryOutcome> {
-    let requested_linkers = inputs
-        .primary_libs
-        .iter()
-        .chain(&inputs.dependency_libs)
-        .map(|lib| lib.linker_name().to_string())
-        .collect::<HashSet<_>>();
     let mut libraries = Vec::new();
     let mut warnings = Vec::new();
 
@@ -472,20 +428,6 @@ fn discover_container_libraries(inputs: &HookInputs) -> Result<DiscoveryOutcome>
         match Library::parse_container(path.clone(), &inputs.rootfs) {
             Ok(lib) => libraries.push(lib),
             Err(error) => {
-                let linker_hint = file_name_to_string(&path)
-                    .ok()
-                    .and_then(|name| linker_name_hint(&name));
-                if let Some(linker_name) = linker_hint {
-                    if requested_linkers.contains(&linker_name) {
-                        return Err(Error::message(format!(
-                            "failed to parse container library {} for requested linker {}: {}",
-                            path.display(),
-                            linker_name,
-                            error
-                        )));
-                    }
-                }
-
                 push_warning(
                     &mut warnings,
                     format!(
@@ -502,10 +444,6 @@ fn discover_container_libraries(inputs: &HookInputs) -> Result<DiscoveryOutcome>
         libraries,
         warnings,
     })
-}
-
-fn linker_name_hint(name: &str) -> Option<String> {
-    name.find(".so").map(|index| name[..index + 3].to_string())
 }
 
 fn plan_config_edits(inputs: &HookInputs, container_libs: &[Library]) -> Result<ConfigEdits> {
@@ -548,12 +486,7 @@ fn plan_config_edits(inputs: &HookInputs, container_libs: &[Library]) -> Result<
             )));
         }
 
-        let decision = choose_primary_mounts(
-            host,
-            &candidates,
-            inputs.compatibility_policy,
-            &fallback_dir,
-        )?;
+        let decision = choose_primary_mounts(host, &candidates, &fallback_dir)?;
         append_decision_mounts(
             &mut mounts,
             &mut ld_library_path_dirs,
@@ -627,85 +560,62 @@ fn append_decision_mounts(
 fn choose_primary_mounts(
     host: &Library,
     candidates: &[Library],
-    compatibility: CompatibilityPolicy,
     fallback_dir: &Path,
 ) -> Result<MountDecision> {
-    if candidates.is_empty() {
-        return fallback_mount_decision(host, fallback_dir, None);
-    }
-
-    let best = select_best_primary_candidate(host, candidates, compatibility)?;
-
-    match compatibility {
-        CompatibilityPolicy::Major => {
-            if host.is_major_compatible_with(&best) {
-                overwrite_mount_decision(host, best)
-            } else {
-                Err(Error::message(major_mismatch_message(host, &best)))
-            }
-        }
-        CompatibilityPolicy::Full => {
-            if host.is_full_compatible_with(&best) {
-                overwrite_mount_decision(host, best)
-            } else if host.is_major_compatible_with(&best) {
-                fallback_mount_decision(
-                    host,
-                    fallback_dir,
-                    Some(partial_compatibility_message(host, &best)),
-                )
-            } else {
-                Err(Error::message(major_mismatch_message(host, &best)))
-            }
-        }
-        CompatibilityPolicy::Strict => {
-            if host.is_strict_compatible_with(&best) {
-                overwrite_mount_decision(host, best)
-            } else {
-                Err(Error::message(strict_mismatch_message(host, &best)))
-            }
-        }
-    }
+    choose_same_major_mounts(host, candidates, fallback_dir)
 }
 
 fn choose_dependency_mounts(
     host: &Library,
+    _candidates: &[Library],
+    fallback_dir: &Path,
+) -> Result<MountDecision> {
+    fallback_mount_decision(
+        host,
+        fallback_dir,
+        Some(format!(
+            "injecting dependency library {} through LD_LIBRARY_PATH fallback",
+            host.path().display()
+        )),
+    )
+}
+
+fn choose_same_major_mounts(
+    host: &Library,
     candidates: &[Library],
     fallback_dir: &Path,
 ) -> Result<MountDecision> {
-    if candidates.is_empty() {
-        return fallback_mount_decision(host, fallback_dir, None);
-    }
+    let same_major_candidates = candidates
+        .iter()
+        .filter(|candidate| host.is_major_compatible_with(candidate))
+        .cloned()
+        .collect::<Vec<_>>();
 
-    let best = select_best_dependency_candidate(host, candidates)?;
-
-    if host.is_full_compatible_with(&best) {
-        overwrite_mount_decision(host, best)
-    } else if host.is_major_compatible_with(&best) {
-        fallback_mount_decision(
-            host,
-            fallback_dir,
-            Some(partial_compatibility_message(host, &best)),
-        )
-    } else {
-        fallback_mount_decision(
+    if same_major_candidates.is_empty() {
+        return fallback_mount_decision(
             host,
             fallback_dir,
             Some(format!(
-                "{}; mounting {} into {} with LD_LIBRARY_PATH fallback",
-                major_mismatch_message(host, &best),
+                "no same-major container match found for host library {}; mounting {} into {} with LD_LIBRARY_PATH fallback",
+                host.real_name(),
                 host.path().display(),
                 fallback_dir.display()
             )),
-        )
+        );
     }
+
+    overwrite_mount_decision(host, &same_major_candidates)
 }
 
-fn overwrite_mount_decision(host: &Library, container: Library) -> Result<MountDecision> {
+fn overwrite_mount_decision(host: &Library, containers: &[Library]) -> Result<MountDecision> {
     Ok(MountDecision {
-        mounts: vec![MountEdit {
-            source: host.path().to_path_buf(),
-            destination: container.path().to_path_buf(),
-        }],
+        mounts: containers
+            .iter()
+            .map(|container| MountEdit {
+                source: host.path().to_path_buf(),
+                destination: container.path().to_path_buf(),
+            })
+            .collect(),
         ld_library_path_dir: None,
         warning: None,
     })
@@ -764,72 +674,6 @@ fn fallback_link_names(file_name: &str) -> Result<Vec<String>> {
         }
     }
     Ok(names)
-}
-
-fn select_best_primary_candidate(
-    host: &Library,
-    candidates: &[Library],
-    compatibility: CompatibilityPolicy,
-) -> Result<Library> {
-    let compatible_candidates = candidates
-        .iter()
-        .filter(|candidate| match compatibility {
-            CompatibilityPolicy::Major => host.is_major_compatible_with(candidate),
-            CompatibilityPolicy::Full => host.is_major_compatible_with(candidate),
-            CompatibilityPolicy::Strict => host.is_strict_compatible_with(candidate),
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-
-    pick_best_candidate(host, candidates, &compatible_candidates)
-}
-
-fn select_best_dependency_candidate(host: &Library, candidates: &[Library]) -> Result<Library> {
-    let compatible_candidates = candidates
-        .iter()
-        .filter(|candidate| host.is_major_compatible_with(candidate))
-        .cloned()
-        .collect::<Vec<_>>();
-
-    pick_best_candidate(host, candidates, &compatible_candidates)
-}
-
-fn pick_best_candidate(
-    host: &Library,
-    candidates: &[Library],
-    compatible_candidates: &[Library],
-) -> Result<Library> {
-    host.pick_best_candidate(if compatible_candidates.is_empty() {
-        candidates
-    } else {
-        compatible_candidates
-    })
-    .cloned()
-    .ok_or_else(|| Error::message("internal error: candidate selection returned no library"))
-}
-
-fn major_mismatch_message(host: &Library, container: &Library) -> String {
-    format!(
-        "primary library {} is not ABI compatible with container library {}",
-        host.real_name(),
-        container.real_name()
-    )
-}
-
-fn partial_compatibility_message(host: &Library, container: &Library) -> String {
-    format!(
-        "partial ABI compatibility detected: host library {} is older than container library {}",
-        host.real_name(),
-        container.real_name()
-    )
-}
-
-fn strict_mismatch_message(host: &Library, container: &Library) -> String {
-    format!(
-        "primary library {} is not strictly ABI compatible with container library {}",
-        host.real_name(),
-        container.real_name()
-    )
 }
 
 fn index_container_libraries(container_libs: &[Library]) -> HashMap<String, Vec<Library>> {
@@ -1197,9 +1041,9 @@ mod tests {
             primary_libs: vec![Library::parse_host(&host_file).unwrap()],
             dependency_libs: Vec::new(),
             extra_files: Vec::new(),
-            compatibility_policy: CompatibilityPolicy::Full,
+            _compatibility_policy: CompatibilityPolicy::Full,
         };
-        let container_libs = vec![Library::parse_host("/usr/lib/libmpi.so.12.4").unwrap()];
+        let container_libs = vec![Library::parse_host("/usr/lib/libmpi.so.13.4").unwrap()];
 
         let edits = plan_config_edits(&inputs, &container_libs).unwrap();
         assert_eq!(edits.mounts.len(), 1);
@@ -1225,6 +1069,7 @@ mod tests {
         let host_file = temp_root.join("host/libmpi.so.12.5");
 
         fs::create_dir_all(rootfs.join("usr/lib64")).unwrap();
+        fs::create_dir_all(rootfs.join("opt/vendor")).unwrap();
         fs::create_dir_all(host_file.parent().unwrap()).unwrap();
         fs::write(&host_file, b"payload").unwrap();
 
@@ -1234,20 +1079,89 @@ mod tests {
             primary_libs: vec![Library::parse_host(&host_file).unwrap()],
             dependency_libs: Vec::new(),
             extra_files: Vec::new(),
-            compatibility_policy: CompatibilityPolicy::Major,
+            _compatibility_policy: CompatibilityPolicy::Major,
         };
-        let container_libs = vec![Library::parse_host("/usr/lib64/libmpi.so.12.3").unwrap()];
+        let container_libs = vec![
+            Library::parse_host("/usr/lib64/libmpi.so.12.3").unwrap(),
+            Library::parse_host("/opt/vendor/libmpi.so.12.7").unwrap(),
+            Library::parse_host("/usr/lib64/libmpi.so.11.9").unwrap(),
+        ];
 
         let edits = plan_config_edits(&inputs, &container_libs).unwrap();
         assert_eq!(
             edits.mounts,
-            vec![MountEdit {
-                source: host_file.clone(),
-                destination: PathBuf::from("/usr/lib64/libmpi.so.12.3"),
-            }]
+            vec![
+                MountEdit {
+                    source: host_file.clone(),
+                    destination: PathBuf::from("/usr/lib64/libmpi.so.12.3"),
+                },
+                MountEdit {
+                    source: host_file.clone(),
+                    destination: PathBuf::from("/opt/vendor/libmpi.so.12.7"),
+                },
+            ]
         );
         assert!(edits.ld_library_path_dirs.is_empty());
         assert!(edits.warnings.is_empty());
+
+        fs::remove_dir_all(&temp_root).unwrap();
+    }
+
+    #[test]
+    fn dependency_always_uses_fallback_mount_after_primary_activation() {
+        let temp_root = unique_temp_path("overwrite-dependency");
+        let rootfs = temp_root.join("rootfs");
+        let primary = temp_root.join("host/libmpi.so.12.5");
+        let dependency = temp_root.join("host/libhwloc.so.15.2");
+
+        fs::create_dir_all(rootfs.join("usr/lib64")).unwrap();
+        fs::create_dir_all(rootfs.join("opt/vendor")).unwrap();
+        fs::create_dir_all(primary.parent().unwrap()).unwrap();
+        fs::write(&primary, b"payload").unwrap();
+        fs::write(&dependency, b"payload").unwrap();
+
+        let inputs = HookInputs {
+            rootfs,
+            ldconfig: "ldconfig".into(),
+            primary_libs: vec![Library::parse_host(&primary).unwrap()],
+            dependency_libs: vec![Library::parse_host(&dependency).unwrap()],
+            extra_files: Vec::new(),
+            _compatibility_policy: CompatibilityPolicy::Full,
+        };
+        let container_libs = vec![
+            Library::parse_host("/usr/lib64/libmpi.so.12.3").unwrap(),
+            Library::parse_host("/usr/lib64/libhwloc.so.15.0").unwrap(),
+            Library::parse_host("/opt/vendor/libhwloc.so.15.9").unwrap(),
+            Library::parse_host("/usr/lib64/libhwloc.so.14.8").unwrap(),
+        ];
+
+        let edits = plan_config_edits(&inputs, &container_libs).unwrap();
+        assert_eq!(
+            edits.mounts,
+            vec![
+                MountEdit {
+                    source: primary.clone(),
+                    destination: PathBuf::from("/usr/lib64/libmpi.so.12.3"),
+                },
+                MountEdit {
+                    source: edits.mounts[1].source.clone(),
+                    destination: PathBuf::from("/run/pc-injection/libhwloc.so.15.2"),
+                },
+            ]
+        );
+        assert_eq!(
+            edits.ld_library_path_dirs,
+            vec![PathBuf::from("/run/pc-injection/libhwloc.so.15.2")]
+        );
+        assert_eq!(
+            edits.warnings,
+            vec![format!(
+                "injecting dependency library {} through LD_LIBRARY_PATH fallback",
+                dependency.display()
+            )]
+        );
+        assert!(fs::symlink_metadata(edits.mounts[1].source.join("libhwloc.so.15")).is_ok());
+        assert!(fs::symlink_metadata(edits.mounts[1].source.join("libhwloc.so.15.2")).is_ok());
 
         fs::remove_dir_all(&temp_root).unwrap();
     }
@@ -1282,7 +1196,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_fails_for_unparseable_requested_library() {
+    fn discovery_warns_for_unparseable_container_library() {
         let temp_root = unique_temp_path("requested-parse");
         let rootfs = temp_root.join("rootfs");
         let host_file = temp_root.join("host/libmpi.so.12");
@@ -1304,13 +1218,13 @@ mod tests {
             primary_libs: vec![Library::parse_host(&host_file).unwrap()],
             dependency_libs: Vec::new(),
             extra_files: Vec::new(),
-            compatibility_policy: CompatibilityPolicy::Major,
+            _compatibility_policy: CompatibilityPolicy::Major,
         };
 
-        let error = discover_container_libraries(&inputs).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("failed to parse container library"));
+        let discovery = discover_container_libraries(&inputs).unwrap();
+        assert!(discovery.libraries.is_empty());
+        assert_eq!(discovery.warnings.len(), 1);
+        assert!(discovery.warnings[0].contains("skipping unparseable container library"));
 
         fs::remove_dir_all(&temp_root).unwrap();
     }
@@ -1335,7 +1249,7 @@ mod tests {
             primary_libs: vec![Library::parse_host(&primary).unwrap()],
             dependency_libs: Vec::new(),
             extra_files: vec![extra.clone()],
-            compatibility_policy: CompatibilityPolicy::Major,
+            _compatibility_policy: CompatibilityPolicy::Major,
         };
         let container_libs = vec![Library::parse_host("/usr/lib/libmpi.so.12.1").unwrap()];
 
