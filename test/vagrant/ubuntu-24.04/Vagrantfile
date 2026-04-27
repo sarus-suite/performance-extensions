@@ -1,0 +1,98 @@
+require "rbconfig"
+
+Vagrant.configure("2") do |config|
+  host_cpu = RbConfig::CONFIG["host_cpu"]
+  guest_arch =
+    case host_cpu
+    when /arm|aarch64/
+      "arm64"
+    else
+      "amd64"
+    end
+
+  image_name = "noble-server-cloudimg-#{guest_arch}.img"
+  image_disk_size = ENV["UBUNTU_CLOUD_IMAGE_SIZE"] || "40G"
+  prepared_image_name = "noble-server-cloudimg-#{guest_arch}-#{image_disk_size.downcase}.qcow2"
+  image_path = ENV["UBUNTU_CLOUD_IMAGE"] || File.expand_path(".cache/#{prepared_image_name}", __dir__)
+  seed_path = ENV["UBUNTU_CLOUD_INIT_SEED"] || File.expand_path(".cache/nocloud-seed.iso", __dir__)
+  qemu_arch = guest_arch == "arm64" ? "aarch64" : "x86_64"
+  qemu_dir_candidates = [
+    ENV["QEMU_DIR"],
+    "/usr/local/share/qemu",
+    "/opt/homebrew/share/qemu"
+  ].compact
+  qemu_dir = qemu_dir_candidates.find { |path| File.directory?(path) }
+  qemu_machine = ENV["QEMU_MACHINE"] || (guest_arch == "arm64" ? "virt,accel=hvf,highmem=off" : "q35")
+  qemu_cpu = ENV["QEMU_CPU"] || (guest_arch == "arm64" ? "cortex-a72" : "qemu64")
+  qemu_smp = ENV["QEMU_SMP"] || "2"
+  qemu_memory = ENV["QEMU_MEMORY"] || (guest_arch == "arm64" ? "2G" : "4G")
+  qemu_ssh_port = ENV["QEMU_SSH_PORT"] || 50022
+
+  config.vm.hostname = "performance-extensions-noble"
+  config.vm.boot_timeout = 900
+
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  repo_root = File.expand_path("../../..", __dir__)
+  config.vm.synced_folder repo_root, "/workspace/performance-extensions",
+    type: "rsync",
+    rsync__exclude: [".git/", "target/", ".vagrant/", ".cache/"]
+
+  config.ssh.username = "vagrant"
+  config.ssh.private_key_path = File.expand_path("~/.vagrant.d/insecure_private_key")
+  config.ssh.insert_key = false
+
+  config.vm.provider "qemu" do |qe|
+    raise <<~MSG unless File.exist?(image_path)
+      Missing Ubuntu cloud image: #{image_path}
+
+      Run:
+        ./prepare-cloud-image.sh
+
+      Or set UBUNTU_CLOUD_IMAGE to an existing Ubuntu 24.04 qcow2 image path.
+    MSG
+
+    raise <<~MSG unless File.exist?(seed_path)
+      Missing NoCloud seed image: #{seed_path}
+
+      Run:
+        ./prepare-cloud-image.sh
+
+      Or set UBUNTU_CLOUD_INIT_SEED to an existing seed ISO path.
+    MSG
+
+    raise <<~MSG if qemu_dir.nil?
+      Missing QEMU firmware directory.
+
+      Checked:
+        #{qemu_dir_candidates.join("\n  ")}
+
+      Set QEMU_DIR to the directory containing edk2 firmware files such as:
+        export QEMU_DIR=/usr/local/share/qemu
+    MSG
+
+    qe.image_path = image_path
+    qe.arch = qemu_arch
+    qe.machine = qemu_machine
+    qe.cpu = qemu_cpu
+    qe.memory = qemu_memory
+    qe.smp = qemu_smp
+    qe.ssh_port = qemu_ssh_port
+    qe.qemu_dir = qemu_dir
+    qe.disk_resize = "40G"
+    qe.ssh_auto_correct = true
+    qe.net_device = guest_arch == "arm64" ? "virtio-net-device" : "virtio-net-pci"
+    qe.extra_qemu_args = %W(-drive file=#{seed_path},if=virtio,media=cdrom,format=raw)
+  end
+
+  config.vm.provision(
+    "shell",
+    path: "provision/install-podman.sh",
+    env: {
+      "PODMAN_STATIC_URL" => ENV["PODMAN_STATIC_URL"],
+      "PODMAN_STATIC_VERSION" => ENV["PODMAN_STATIC_VERSION"],
+      "VM_USER" => ENV["VM_USER"]
+    },
+    args: ["/workspace/performance-extensions"]
+  )
+end
