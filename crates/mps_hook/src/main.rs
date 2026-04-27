@@ -63,7 +63,10 @@ fn run_unix() -> i32 {
 
 /// ps/grep check: returns true if `nvidia-cuda-mps-server` is running for the given UID.
 fn server_running_for_uid_ps_grep(uid: u32) -> Result<bool, String> {
-    let pattern = format!(r#"ps -eo uid=,comm= | grep -E "^\s*{}\s+nvidia-cuda-mps-server(\s|$)" -q"#, uid);
+    let pattern = format!(
+        r#"ps -eo uid=,comm= | grep -E "^\s*{}\s+nvidia-cuda-mps-server(\s|$)" -q"#,
+        uid
+    );
     let status = Command::new("sh")
         .arg("-lc")
         .arg(&pattern)
