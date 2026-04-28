@@ -494,7 +494,6 @@ fn plan_config_edits(inputs: &HookInputs, container_libs: &[Library]) -> Result<
             &mut mounts,
             &mut ld_library_path_dirs,
             &mut warnings,
-            &inputs.rootfs,
             decision,
         )?;
     }
@@ -511,20 +510,20 @@ fn plan_config_edits(inputs: &HookInputs, container_libs: &[Library]) -> Result<
             &mut mounts,
             &mut ld_library_path_dirs,
             &mut warnings,
-            &inputs.rootfs,
             decision,
         )?;
     }
 
     for file in &inputs.extra_files {
         validate_extra_source_file(file)?;
-        validate_mount_destination(&inputs.rootfs, file)?;
+        validate_mount_destination(file)?;
         mounts.push(MountEdit {
             source: file.clone(),
             destination: file.clone(),
         });
     }
 
+    // Ensure we do not have duplicated decisions
     dedupe_mounts(&mut mounts)?;
     dedupe_paths(&mut ld_library_path_dirs);
 
@@ -539,12 +538,11 @@ fn append_decision_mounts(
     mounts: &mut Vec<MountEdit>,
     ld_library_path_dirs: &mut Vec<PathBuf>,
     warnings: &mut Vec<String>,
-    rootfs: &Path,
     decision: MountDecision,
 ) -> Result<()> {
     for mount in decision.mounts {
         if !mount.destination.starts_with("/run/pc-injection") {
-            validate_mount_destination(rootfs, &mount.destination)?;
+            validate_mount_destination(&mount.destination)?;
         }
         mounts.push(mount);
     }
@@ -782,98 +780,40 @@ fn validate_extra_source_file(source: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_mount_destination(rootfs: &Path, destination: &Path) -> Result<()> {
-    let rootfs_real = fs::canonicalize(rootfs)
-        .map_err(|e| Error::io(format!("failed to resolve rootfs {}", rootfs.display()), e))?;
-    let relative = normalize_container_relative_path(destination)?;
-    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
-    let parent_real = resolve_existing_directory_in_rootfs(&rootfs_real, parent)?;
-    if !parent_real.starts_with(&rootfs_real) {
+fn validate_mount_destination(destination: &Path) -> Result<()> {
+    if !destination.is_absolute() {
         return Err(Error::message(format!(
-            "mount destination escapes the rootfs: {}",
+            "mount destination must be absolute: {}",
             destination.display()
         )));
     }
 
-    let target = parent_real.join(relative.file_name().ok_or_else(|| {
-        Error::message(format!(
-            "mount destination has no file name: {}",
-            destination.display()
-        ))
-    })?);
-    if let Ok(metadata) = fs::symlink_metadata(&target) {
-        let file_type = metadata.file_type();
-        if file_type.is_dir() && !file_type.is_symlink() {
-            return Err(Error::message(format!(
-                "mount destination already exists as a directory: {}",
-                destination.display()
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-fn normalize_container_relative_path(destination: &Path) -> Result<PathBuf> {
-    let relative = match destination.strip_prefix("/") {
-        Ok(relative) => relative,
-        Err(_) => destination,
-    };
-
-    let mut normalized = PathBuf::new();
-    for component in relative.components() {
+    for component in destination.components() {
         match component {
-            Component::Normal(part) => normalized.push(part),
+            Component::Normal(_) | Component::RootDir => {}
             Component::CurDir | Component::ParentDir => {
                 return Err(Error::message(format!(
                     "mount destination must not contain '.' or '..' components: {}",
                     destination.display()
                 )));
             }
-            Component::RootDir | Component::Prefix(_) => {
+            Component::Prefix(_) => {
                 return Err(Error::message(format!(
-                    "mount destination must be a normalized container path: {}",
+                    "mount destination must be a Unix-style absolute path: {}",
                     destination.display()
                 )));
             }
         }
     }
 
-    if normalized.file_name().is_none() {
+    if destination.file_name().is_none() {
         return Err(Error::message(format!(
             "mount destination has no valid file name: {}",
             destination.display()
         )));
     }
 
-    Ok(normalized)
-}
-
-fn resolve_existing_directory_in_rootfs(rootfs: &Path, relative: &Path) -> Result<PathBuf> {
-    let mut current = rootfs.to_path_buf();
-    for component in relative.components() {
-        current.push(component.as_os_str());
-        let metadata = fs::symlink_metadata(&current)
-            .map_err(|e| Error::io(format!("failed to inspect {}", current.display()), e))?;
-        let file_type = metadata.file_type();
-        if !file_type.is_dir() && !file_type.is_symlink() {
-            return Err(Error::message(format!(
-                "mount destination parent is not a directory: {}",
-                current.display()
-            )));
-        }
-
-        current = fs::canonicalize(&current)
-            .map_err(|e| Error::io(format!("failed to resolve {}", current.display()), e))?;
-        if !current.starts_with(rootfs) {
-            return Err(Error::message(format!(
-                "mount destination escapes the rootfs through {}",
-                current.display()
-            )));
-        }
-    }
-
-    Ok(current)
+    Ok(())
 }
 
 fn resolve_in_rootfs(rootfs: &Path, container_path: &Path) -> PathBuf {
@@ -920,6 +860,7 @@ fn dedupe_paths(paths: &mut Vec<PathBuf>) {
     paths.retain(|path| seen.insert(path.clone()));
 }
 
+// Now we apply edit to OCI config
 fn apply_config_edits(config: &mut Value, edits: &ConfigEdits) -> Result<()> {
     let obj = config
         .as_object_mut()
@@ -971,6 +912,7 @@ fn merge_ld_library_path(obj: &mut Map<String, Value>, dirs: &[PathBuf]) -> Resu
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>();
 
+    // ensuring OCI json has config.process.env entry
     let process_val = obj
         .entry("process".to_string())
         .or_insert_with(|| Value::Object(Map::new()));
@@ -979,13 +921,13 @@ fn merge_ld_library_path(obj: &mut Map<String, Value>, dirs: &[PathBuf]) -> Resu
         .ok_or_else(|| Error::message("validation error: 'process' exists but is not an object"))?;
     let env_arr = ensure_array_field(process_obj, "env")?;
 
+    // check if we already got an env with LD_LIBRARY_PATH
     let existing_index = env_arr.iter().rposition(|value| {
         value
             .as_str()
             .and_then(|entry| entry.split_once('=').map(|(key, _)| key))
             .is_some_and(|key| key == "LD_LIBRARY_PATH")
     });
-
     let existing_entries = existing_index
         .and_then(|idx| env_arr[idx].as_str())
         .and_then(|entry| entry.split_once('=').map(|(_, value)| value.to_string()))
@@ -993,11 +935,13 @@ fn merge_ld_library_path(obj: &mut Map<String, Value>, dirs: &[PathBuf]) -> Resu
 
     let mut merged = Vec::new();
     let mut seen = HashSet::new();
+    // Add new libs first
     for dir in &dirs_as_strings {
         if seen.insert(dir.clone()) {
             merged.push(dir.clone());
         }
     }
+    // Append existing entries
     for dir in existing_entries
         .split(':')
         .filter(|entry| !entry.is_empty())
@@ -1007,6 +951,7 @@ fn merge_ld_library_path(obj: &mut Map<String, Value>, dirs: &[PathBuf]) -> Resu
         }
     }
 
+    // Replace or append into env_var
     let value = format!("LD_LIBRARY_PATH={}", merged.join(":"));
     match existing_index {
         Some(idx) => env_arr[idx] = Value::String(value),
@@ -1089,7 +1034,7 @@ mod tests {
             vec![
                 "skipping same-name container libraries with different major ABI for libmpi.so.12.2: libmpi.so.13.4".to_string(),
                 format!(
-                    "no same-major container match found for host library {}; mounting {} into {} with LD_LIBRARY_PATH fallback",
+                    "no same-major container match found for host library {}; mounting {} into {} with LD_LIBRARY_PATH",
                     "libmpi.so.12.2",
                     host_file.display(),
                     "/run/pc-injection"
