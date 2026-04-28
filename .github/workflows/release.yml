@@ -68,5 +68,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: hooks-${{ matrix.arch }}
-          path: dist/hooks-${{ matrix.arch }}.tar
+          path: dist/hooks-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
