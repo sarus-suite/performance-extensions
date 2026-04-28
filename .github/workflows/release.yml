@@ -2,7 +2,7 @@ name: release (use devcontainer + cached)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, archive_artifact ]
   workflow_dispatch:            # run manually from the Actions tab
     inputs:
       ref:
@@ -55,31 +55,18 @@ jobs:
           runCmd: |
             bash -lc '
               cargo build --release
-              cp target/release/ldcache_hook "target/release/ldcache_hook-${{ matrix.arch }}"
-              cp target/release/pce_hook "target/release/pce_hook-${{ matrix.arch }}"
-              cp target/release/mps_hook "target/release/mps_hook-${{ matrix.arch }}"
+              mkdir -p dist/hooks-${{ matrix.arch }}
+              cp target/release/ldcache_hook "dist/hooks-${{ matrix.arch }}/ldcache_hook"
+              cp target/release/pce_hook "dist/hooks-${{ matrix.arch }}/pce_hook"
+              cp target/release/mps_hook "dist/hooks-${{ matrix.arch }}/mps_hook"
+              tar -C dist/hooks-${{ matrix.arch }} -cf "dist/hooks-${{ matrix.arch }}.tar" .
               ls -lah target/release/
+              ls -lah dist/
             '
 
-      # Keep CI artifact
-      - name: Upload build ldcache
+      - name: Upload hook archive
         uses: actions/upload-artifact@v4
         with:
-          name: ldcache_hook-${{ github.ref_name }}-${{ matrix.arch }}
-          path: target/release/ldcache_hook-${{ matrix.arch }}
+          name: hooks-${{ matrix.arch }}
+          path: dist/hooks-${{ matrix.arch }}.tar
           if-no-files-found: error
-
-      - name: Upload build pce
-        uses: actions/upload-artifact@v4
-        with:
-          name: pce_hook-${{ github.ref_name }}-${{ matrix.arch }}
-          path: target/release/pce_hook-${{ matrix.arch }}
-          if-no-files-found: error
-
-      - name: Upload build mps
-        uses: actions/upload-artifact@v4
-        with:
-          name: mps_hook-${{ github.ref_name }}-${{ matrix.arch }}
-          path: target/release/mps_hook-${{ matrix.arch }}
-          if-no-files-found: error
-
