@@ -59,7 +59,7 @@ jobs:
               cp target/release/ldcache_hook "dist/hooks-${{ matrix.arch }}/ldcache_hook"
               cp target/release/pce_hook "dist/hooks-${{ matrix.arch }}/pce_hook"
               cp target/release/mps_hook "dist/hooks-${{ matrix.arch }}/mps_hook"
-              tar -C dist/hooks-${{ matrix.arch }} -cf "dist/hooks-${{ matrix.arch }}.tar" .
+              tar -C dist/hooks-${{ matrix.arch }} -czf "dist/hooks-${{ matrix.arch }}.tar" .
               ls -lah target/release/
               ls -lah dist/
             '
