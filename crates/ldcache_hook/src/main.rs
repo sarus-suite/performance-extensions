@@ -1,7 +1,6 @@
 use serde::Deserialize;
 use std::{
-    env,
-    fs,
+    env, fs,
     io::{self, Read},
     path::{Path, PathBuf},
     process::{self, Command, Stdio},
@@ -130,4 +129,3 @@ fn summarize_cache(rootfs: &Path) {
         }
     }
 }
-
