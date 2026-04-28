@@ -1,4 +1,4 @@
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::error::Error as StdError;
@@ -91,6 +91,8 @@ struct HookInputs {
     primary_libs: Vec<Library>,
     dependency_libs: Vec<Library>,
     extra_files: Vec<PathBuf>,
+    extra_mounts: Vec<ExtraMountEdit>,
+    extra_env: Vec<String>,
     _compatibility_policy: CompatibilityPolicy,
 }
 
@@ -137,6 +139,8 @@ struct DiscoveryOutcome {
 struct ConfigEdits {
     mounts: Vec<MountEdit>,
     ld_library_path_dirs: Vec<PathBuf>,
+    extra_mounts: Vec<ExtraMountEdit>,
+    extra_env: Vec<String>,
     warnings: Vec<String>,
 }
 
@@ -144,6 +148,14 @@ struct ConfigEdits {
 struct MountEdit {
     source: PathBuf,
     destination: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExtraMountEdit {
+    source: PathBuf,
+    destination: PathBuf,
+    mount_type: String,
+    options: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -187,6 +199,8 @@ fn load_inputs(config: &Value) -> Result<HookInputs> {
         primary_libs: parse_required_library_list("INJECTION_PRIMARY_LIBS")?,
         dependency_libs: parse_optional_library_list("INJECTION_DEPENDENCY_LIBS")?,
         extra_files: parse_optional_path_list("INJECTION_EXTRA_FILES"),
+        extra_mounts: parse_optional_mount_specs("INJECTION_EXTRA_MOUNTS")?,
+        extra_env: parse_optional_env_specs("INJECTION_EXTRA_ENV")?,
         _compatibility_policy: CompatibilityPolicy::from_env("INJECTION_COMPATIBILITY")?,
     })
 }
@@ -233,6 +247,123 @@ fn parse_optional_path_list(var: &'static str) -> Vec<PathBuf> {
         Some(value) if !value.is_empty() => env::split_paths(&value).collect(),
         _ => Vec::new(),
     }
+}
+
+fn parse_optional_env_specs(var: &'static str) -> Result<Vec<String>> {
+    let Some(raw) = env::var_os(var) else {
+        return Ok(Vec::new());
+    };
+
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let raw = raw
+        .to_str()
+        .ok_or_else(|| Error::message(format!("{var} must contain valid UTF-8")))?;
+
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let entries = raw
+        .split(';')
+        .filter(|entry| !entry.trim().is_empty())
+        .map(|entry| entry.trim().to_string())
+        .collect::<Vec<_>>();
+
+    validate_env_strings(&entries)?;
+    Ok(entries)
+}
+
+fn parse_optional_mount_specs(var: &'static str) -> Result<Vec<ExtraMountEdit>> {
+    let Some(raw) = env::var_os(var) else {
+        return Ok(Vec::new());
+    };
+
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let raw = raw
+        .to_str()
+        .ok_or_else(|| Error::message(format!("{var} must contain valid UTF-8")))?;
+
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    raw.split(';')
+        .filter(|entry| !entry.trim().is_empty())
+        .map(|entry| parse_mount_spec_entry(var, entry.trim()))
+        .collect()
+}
+
+fn parse_mount_spec_entry(var: &'static str, entry: &str) -> Result<ExtraMountEdit> {
+    let parts = entry.splitn(4, ':').collect::<Vec<_>>();
+    if parts.len() != 4 {
+        return Err(Error::message(format!(
+            "{var} mount entries must use source:destination:type:options format: {entry}"
+        )));
+    }
+
+    let source = PathBuf::from(parts[0].trim());
+    let destination = PathBuf::from(parts[1].trim());
+    let mount_type = parts[2].trim();
+    let options = if parts[3].trim().is_empty() {
+        Vec::new()
+    } else {
+        parts[3]
+            .split(',')
+            .map(str::trim)
+            .filter(|option| !option.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    };
+
+    validate_mount_source_path(&source, "extra mount source")?;
+    validate_mount_destination(&destination)?;
+    validate_mount_options(&options)?;
+
+    let mount_type = match mount_type {
+        "" | "none" | "bind" => "bind".to_string(),
+        other => {
+            return Err(Error::message(format!(
+                "unsupported extra mount type '{other}', only bind-style mounts are supported"
+            )))
+        }
+    };
+
+    Ok(ExtraMountEdit {
+        source,
+        destination,
+        mount_type,
+        options: strip_non_oci_mount_options(options),
+    })
+}
+
+fn strip_non_oci_mount_options(options: Vec<String>) -> Vec<String> {
+    options
+        .into_iter()
+        .filter(|option| option != "x-create=dir")
+        .collect()
+}
+
+fn validate_mount_options(options: &[String]) -> Result<()> {
+    for option in options {
+        match option.as_str() {
+            "bind" | "rbind" | "ro" | "rw" | "nosuid" | "suid" | "nodev" | "dev" | "noexec"
+            | "exec" | "private" | "rprivate" | "slave" | "rslave" | "shared" | "rshared"
+            | "x-create=dir" => {}
+            other => {
+                return Err(Error::message(format!(
+                    "unsupported extra mount option '{other}'"
+                )))
+            }
+        }
+    }
+
+    Ok(())
 }
 
 impl CompatibilityPolicy {
@@ -523,6 +654,11 @@ fn plan_config_edits(inputs: &HookInputs, container_libs: &[Library]) -> Result<
         });
     }
 
+    let mut extra_mounts = inputs.extra_mounts.clone();
+    dedupe_extra_mounts(&mut extra_mounts)?;
+    validate_mount_conflicts(&mounts, &extra_mounts)?;
+    let extra_env = inputs.extra_env.clone();
+
     // Ensure we do not have duplicated decisions
     dedupe_mounts(&mut mounts)?;
     dedupe_paths(&mut ld_library_path_dirs);
@@ -530,6 +666,8 @@ fn plan_config_edits(inputs: &HookInputs, container_libs: &[Library]) -> Result<
     Ok(ConfigEdits {
         mounts,
         ld_library_path_dirs,
+        extra_mounts,
+        extra_env,
         warnings,
     })
 }
@@ -614,11 +752,7 @@ fn choose_same_major_mounts(
             host.path().display(),
             fallback_dir.display()
         ));
-        return fallback_mount_decision(
-            host,
-            fallback_dir,
-            warnings,
-        );
+        return fallback_mount_decision(host, fallback_dir, warnings);
     }
 
     overwrite_mount_decision(host, &same_major_candidates, warnings)
@@ -642,7 +776,6 @@ fn overwrite_mount_decision(
         warnings,
     })
 }
-
 
 // inject a library through a temporal dir mount containing the right library names as symlinks to the host file, mounts that directory into the container, and tells the dynamic linker to search there
 fn fallback_mount_decision(
@@ -753,6 +886,28 @@ fn validate_regular_source_file(source: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_mount_source_path(source: &Path, label: &str) -> Result<()> {
+    if !source.is_absolute() {
+        return Err(Error::message(format!(
+            "{label} must be absolute: {}",
+            source.display()
+        )));
+    }
+
+    let source_metadata = fs::symlink_metadata(source)
+        .map_err(|e| Error::io(format!("failed to stat {label} {}", source.display()), e))?;
+    let file_type = source_metadata.file_type();
+
+    if !(file_type.is_file() || file_type.is_dir()) {
+        return Err(Error::message(format!(
+            "{label} must be a regular file or directory: {}",
+            source.display()
+        )));
+    }
+
+    Ok(())
+}
+
 // INJECTION_EXTRA_FILES are raw file mounts and we need those to be exact
 fn validate_extra_source_file(source: &Path) -> Result<()> {
     let source_metadata = fs::symlink_metadata(source).map_err(|e| {
@@ -855,6 +1010,59 @@ fn dedupe_mounts(mounts: &mut Vec<MountEdit>) -> Result<()> {
     Ok(())
 }
 
+fn dedupe_extra_mounts(mounts: &mut Vec<ExtraMountEdit>) -> Result<()> {
+    let mut seen = HashMap::<PathBuf, (PathBuf, String, Vec<String>)>::new();
+    let mut deduped = Vec::new();
+
+    for mount in mounts.drain(..) {
+        match seen.get(&mount.destination) {
+            Some((existing_source, existing_type, existing_options))
+                if existing_source != &mount.source
+                    || existing_type != &mount.mount_type
+                    || existing_options != &mount.options =>
+            {
+                return Err(Error::message(format!(
+                    "conflicting planned extra mounts for {}",
+                    mount.destination.display()
+                )))
+            }
+            Some(_) => {}
+            None => {
+                seen.insert(
+                    mount.destination.clone(),
+                    (
+                        mount.source.clone(),
+                        mount.mount_type.clone(),
+                        mount.options.clone(),
+                    ),
+                );
+                deduped.push(mount);
+            }
+        }
+    }
+
+    *mounts = deduped;
+    Ok(())
+}
+
+fn validate_mount_conflicts(mounts: &[MountEdit], extra_mounts: &[ExtraMountEdit]) -> Result<()> {
+    let planned_mounts: HashSet<_> = mounts
+        .iter()
+        .map(|mount| mount.destination.clone())
+        .collect();
+
+    for mount in extra_mounts {
+        if planned_mounts.contains(&mount.destination) {
+            return Err(Error::message(format!(
+                "conflicting planned mounts for {}: destination already used by library injection",
+                mount.destination.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 fn dedupe_paths(paths: &mut Vec<PathBuf>) {
     let mut seen = HashSet::new();
     paths.retain(|path| seen.insert(path.clone()));
@@ -872,6 +1080,14 @@ fn apply_config_edits(config: &mut Value, edits: &ConfigEdits) -> Result<()> {
 
     if !edits.ld_library_path_dirs.is_empty() {
         merge_ld_library_path(obj, &edits.ld_library_path_dirs)?;
+    }
+
+    if !edits.extra_mounts.is_empty() {
+        append_extra_mounts(obj, &edits.extra_mounts)?;
+    }
+
+    if !edits.extra_env.is_empty() {
+        merge_process_env_strings(obj, &edits.extra_env)?;
     }
 
     Ok(())
@@ -899,6 +1115,33 @@ fn append_mounts(obj: &mut Map<String, Value>, mounts_to_add: &[MountEdit]) -> R
                     .map(|value| Value::String(value.to_string()))
                     .collect(),
             ),
+        );
+        mounts.push(Value::Object(out));
+    }
+
+    Ok(())
+}
+
+fn append_extra_mounts(
+    obj: &mut Map<String, Value>,
+    mounts_to_add: &[ExtraMountEdit],
+) -> Result<()> {
+    let mounts = ensure_array_field(obj, "mounts")?;
+
+    for mount in mounts_to_add {
+        let mut out = Map::new();
+        out.insert(
+            "destination".to_string(),
+            Value::String(mount.destination.display().to_string()),
+        );
+        out.insert("type".to_string(), Value::String(mount.mount_type.clone()));
+        out.insert(
+            "source".to_string(),
+            Value::String(mount.source.display().to_string()),
+        );
+        out.insert(
+            "options".to_string(),
+            Value::Array(mount.options.iter().cloned().map(Value::String).collect()),
         );
         mounts.push(Value::Object(out));
     }
@@ -961,6 +1204,56 @@ fn merge_ld_library_path(obj: &mut Map<String, Value>, dirs: &[PathBuf]) -> Resu
     Ok(())
 }
 
+fn validate_env_strings(entries: &[String]) -> Result<()> {
+    for entry in entries {
+        validate_kv_format(entry)?;
+    }
+
+    Ok(())
+}
+
+fn validate_kv_format(entry: &str) -> Result<()> {
+    if let Some((key, _)) = entry.split_once('=') {
+        if key.is_empty() {
+            return Err(Error::message("empty environment variable name before '='"));
+        }
+        Ok(())
+    } else {
+        Err(Error::message(format!(
+            "invalid env entry (expected KEY=VALUE): {entry}"
+        )))
+    }
+}
+
+fn merge_process_env_strings(obj: &mut Map<String, Value>, env_entries: &[String]) -> Result<()> {
+    let process_val = obj
+        .entry("process".to_string())
+        .or_insert_with(|| json!({}));
+    let process_obj = process_val
+        .as_object_mut()
+        .ok_or_else(|| Error::message("validation error: 'process' exists but is not an object"))?;
+    let env_arr = ensure_array_field(process_obj, "env")?;
+
+    for new in env_entries {
+        let (new_key, _) = new
+            .split_once('=')
+            .expect("environment entries must be validated before merging");
+
+        if let Some(idx) = env_arr.iter().rposition(|value| {
+            value
+                .as_str()
+                .and_then(|entry| entry.split_once('=').map(|(key, _)| key))
+                .is_some_and(|key| key == new_key)
+        }) {
+            env_arr[idx] = Value::String(new.clone());
+        } else {
+            env_arr.push(Value::String(new.clone()));
+        }
+    }
+
+    Ok(())
+}
+
 fn ensure_array_field<'a>(
     obj: &'a mut Map<String, Value>,
     field: &str,
@@ -1013,6 +1306,8 @@ mod tests {
             primary_libs: vec![Library::parse_host(&host_file).unwrap()],
             dependency_libs: Vec::new(),
             extra_files: Vec::new(),
+            extra_mounts: Vec::new(),
+            extra_env: Vec::new(),
             _compatibility_policy: CompatibilityPolicy::Full,
         };
         let container_libs = vec![Library::parse_host("/usr/lib/libmpi.so.13.4").unwrap()];
@@ -1062,6 +1357,8 @@ mod tests {
             primary_libs: vec![Library::parse_host(&host_file).unwrap()],
             dependency_libs: Vec::new(),
             extra_files: Vec::new(),
+            extra_mounts: Vec::new(),
+            extra_env: Vec::new(),
             _compatibility_policy: CompatibilityPolicy::Major,
         };
         let container_libs = vec![
@@ -1112,6 +1409,8 @@ mod tests {
             primary_libs: vec![Library::parse_host(&host_file).unwrap()],
             dependency_libs: Vec::new(),
             extra_files: Vec::new(),
+            extra_mounts: Vec::new(),
+            extra_env: Vec::new(),
             _compatibility_policy: CompatibilityPolicy::Major,
         };
         let container_libs = vec![
@@ -1158,6 +1457,8 @@ mod tests {
             primary_libs: vec![Library::parse_host(&primary).unwrap()],
             dependency_libs: vec![Library::parse_host(&dependency).unwrap()],
             extra_files: Vec::new(),
+            extra_mounts: Vec::new(),
+            extra_env: Vec::new(),
             _compatibility_policy: CompatibilityPolicy::Full,
         };
         let container_libs = vec![
@@ -1213,6 +1514,18 @@ mod tests {
                 destination: PathBuf::from("/lib/libmpi.so.12"),
             }],
             ld_library_path_dirs: vec![PathBuf::from("/lib")],
+            extra_mounts: vec![ExtraMountEdit {
+                source: PathBuf::from("/var/spool/slurmd"),
+                destination: PathBuf::from("/var/spool/slurmd"),
+                mount_type: "bind".to_string(),
+                options: vec![
+                    "bind".to_string(),
+                    "rw".to_string(),
+                    "nosuid".to_string(),
+                    "nodev".to_string(),
+                ],
+            }],
+            extra_env: vec!["MPIR_CVAR_CH4_OFI_MULTI_NIC_STRIPING_THRESHOLD=100000000".to_string()],
             warnings: Vec::new(),
         };
 
@@ -1221,10 +1534,18 @@ mod tests {
         assert!(env
             .iter()
             .any(|value| value == "LD_LIBRARY_PATH=/lib:/usr/lib64"));
+        assert!(env
+            .iter()
+            .any(|value| { value == "MPIR_CVAR_CH4_OFI_MULTI_NIC_STRIPING_THRESHOLD=100000000" }));
         let mounts = config["mounts"].as_array().unwrap();
-        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts.len(), 2);
         assert_eq!(mounts[0]["type"], "bind");
         assert_eq!(mounts[0]["destination"], "/lib/libmpi.so.12");
+        assert_eq!(mounts[1]["destination"], "/var/spool/slurmd");
+        assert_eq!(
+            mounts[1]["options"],
+            serde_json::json!(["bind", "rw", "nosuid", "nodev"])
+        );
     }
 
     #[test]
@@ -1250,6 +1571,8 @@ mod tests {
             primary_libs: vec![Library::parse_host(&host_file).unwrap()],
             dependency_libs: Vec::new(),
             extra_files: Vec::new(),
+            extra_mounts: Vec::new(),
+            extra_env: Vec::new(),
             _compatibility_policy: CompatibilityPolicy::Major,
         };
 
@@ -1281,6 +1604,8 @@ mod tests {
             primary_libs: vec![Library::parse_host(&primary).unwrap()],
             dependency_libs: Vec::new(),
             extra_files: vec![extra.clone()],
+            extra_mounts: Vec::new(),
+            extra_env: Vec::new(),
             _compatibility_policy: CompatibilityPolicy::Major,
         };
         let container_libs = vec![Library::parse_host("/usr/lib/libmpi.so.12.1").unwrap()];
@@ -1297,5 +1622,60 @@ mod tests {
         assert!(error
             .to_string()
             .contains("requires an absolute OCI root.path"));
+    }
+
+    #[test]
+    fn parse_optional_env_specs_accepts_semicolon_separated_entries() {
+        std::env::set_var(
+            "INJECTION_EXTRA_ENV",
+            "FOO=bar;MPIR_CVAR_CH4_OFI_MULTI_NIC_STRIPING_THRESHOLD=100000000",
+        );
+
+        let entries = parse_optional_env_specs("INJECTION_EXTRA_ENV").unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                "FOO=bar".to_string(),
+                "MPIR_CVAR_CH4_OFI_MULTI_NIC_STRIPING_THRESHOLD=100000000".to_string()
+            ]
+        );
+
+        std::env::remove_var("INJECTION_EXTRA_ENV");
+    }
+
+    #[test]
+    fn parse_optional_mount_specs_normalizes_bind_mounts() {
+        let temp_root = unique_temp_path("extra-mount-spec");
+        let mount_source = temp_root.join("var/spool/slurmd");
+        fs::create_dir_all(&mount_source).unwrap();
+
+        std::env::set_var(
+            "INJECTION_EXTRA_MOUNTS",
+            format!(
+                "{}:/var/spool/slurmd:none:x-create=dir,bind,rw,nosuid,noexec,nodev,private",
+                mount_source.display()
+            ),
+        );
+
+        let mounts = parse_optional_mount_specs("INJECTION_EXTRA_MOUNTS").unwrap();
+        assert_eq!(
+            mounts,
+            vec![ExtraMountEdit {
+                source: mount_source.clone(),
+                destination: PathBuf::from("/var/spool/slurmd"),
+                mount_type: "bind".to_string(),
+                options: vec![
+                    "bind".to_string(),
+                    "rw".to_string(),
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "nodev".to_string(),
+                    "private".to_string(),
+                ],
+            }]
+        );
+
+        std::env::remove_var("INJECTION_EXTRA_MOUNTS");
+        fs::remove_dir_all(&temp_root).unwrap();
     }
 }
