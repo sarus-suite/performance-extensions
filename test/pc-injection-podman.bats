@@ -20,7 +20,8 @@ make_pc_injection_hook_dir() {
     return 1
   fi
 
-  cat >"$hooks_dir/pc-injection.json" <<EOF
+  if [[ -n "$dependency_lib" ]]; then
+    cat >"$hooks_dir/pc-injection.json" <<EOF
 {
   "version": "1.0.0",
   "hook": {
@@ -40,6 +41,27 @@ make_pc_injection_hook_dir() {
   "stages": ["precreate"]
 }
 EOF
+  else
+    cat >"$hooks_dir/pc-injection.json" <<EOF
+{
+  "version": "1.0.0",
+  "hook": {
+    "path": "$bin",
+    "env": [
+      "LDCONFIG_PATH=$ldconfig_path",
+      "INJECTION_PRIMARY_LIBS=$primary_lib",
+      "INJECTION_COMPATIBILITY=major"
+    ]
+  },
+  "when": {
+    "annotations": {
+      "pc-injection.enable": "^true$"
+    }
+  },
+  "stages": ["precreate"]
+}
+EOF
+  fi
 
   printf '%s\n' "$hooks_dir"
 }
@@ -63,7 +85,8 @@ make_pc_injection_hook_dir_with_extras() {
     return 1
   fi
 
-  cat >"$hooks_dir/pc-injection.json" <<EOF
+  if [[ -n "$dependency_lib" ]]; then
+    cat >"$hooks_dir/pc-injection.json" <<EOF
 {
   "version": "1.0.0",
   "hook": {
@@ -85,6 +108,29 @@ make_pc_injection_hook_dir_with_extras() {
   "stages": ["precreate"]
 }
 EOF
+  else
+    cat >"$hooks_dir/pc-injection.json" <<EOF
+{
+  "version": "1.0.0",
+  "hook": {
+    "path": "$bin",
+    "env": [
+      "LDCONFIG_PATH=$ldconfig_path",
+      "INJECTION_PRIMARY_LIBS=$primary_lib",
+      "INJECTION_EXTRA_MOUNTS=$extra_mounts",
+      "INJECTION_EXTRA_ENV=$extra_env",
+      "INJECTION_COMPATIBILITY=major"
+    ]
+  },
+  "when": {
+    "annotations": {
+      "pc-injection.enable": "^true$"
+    }
+  },
+  "stages": ["precreate"]
+}
+EOF
+  fi
 
   printf '%s\n' "$hooks_dir"
 }
@@ -196,7 +242,7 @@ EOF
   hooks_dir="$(
     make_pc_injection_hook_dir_with_extras \
       "$primary_lib" \
-      "$primary_lib" \
+      "" \
       "$ldconfig_path" \
       "$extra_mounts" \
       "$extra_env"
