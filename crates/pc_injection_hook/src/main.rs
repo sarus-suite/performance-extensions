@@ -150,7 +150,7 @@ struct MountEdit {
 struct MountDecision {
     mounts: Vec<MountEdit>,
     ld_library_path_dir: Option<PathBuf>,
-    warning: Option<String>,
+    warnings: Vec<String>,
 }
 
 fn read_stdin_json_value() -> Result<Value> {
@@ -453,6 +453,7 @@ fn plan_config_edits(inputs: &HookInputs, container_libs: &[Library]) -> Result<
     let mut warnings = Vec::new();
     let mut ld_library_path_dirs = Vec::new();
 
+    // at least 1 library to inject needs to exist in container
     if !inputs
         .primary_libs
         .iter()
@@ -463,6 +464,7 @@ fn plan_config_edits(inputs: &HookInputs, container_libs: &[Library]) -> Result<
         ));
     }
 
+    // check injection has major ABI
     for lib in &inputs.primary_libs {
         validate_regular_source_file(lib.path(), "primary library")?;
         if !lib.has_major_version() {
@@ -473,6 +475,7 @@ fn plan_config_edits(inputs: &HookInputs, container_libs: &[Library]) -> Result<
         }
     }
 
+    // here we decide if we replace or add
     for host in &inputs.primary_libs {
         let candidates = container_index
             .get(host.linker_name())
@@ -550,7 +553,7 @@ fn append_decision_mounts(
         ld_library_path_dirs.push(dir);
     }
 
-    if let Some(warning) = decision.warning {
+    for warning in decision.warnings {
         push_warning(warnings, warning);
     }
 
@@ -573,10 +576,10 @@ fn choose_dependency_mounts(
     fallback_mount_decision(
         host,
         fallback_dir,
-        Some(format!(
+        vec![format!(
             "injecting dependency library {} through LD_LIBRARY_PATH fallback",
             host.path().display()
-        )),
+        )],
     )
 }
 
@@ -585,6 +588,21 @@ fn choose_same_major_mounts(
     candidates: &[Library],
     fallback_dir: &Path,
 ) -> Result<MountDecision> {
+    let mut warnings = Vec::new();
+    let mismatched_candidates = candidates
+        .iter()
+        .filter(|candidate| candidate.linker_name() == host.linker_name())
+        .filter(|candidate| !host.is_major_compatible_with(candidate))
+        .map(|candidate| candidate.real_name().to_string())
+        .collect::<Vec<_>>();
+    if !mismatched_candidates.is_empty() {
+        warnings.push(format!(
+            "skipping same-name container libraries with different major ABI for {}: {}",
+            host.real_name(),
+            mismatched_candidates.join(", ")
+        ));
+    }
+
     let same_major_candidates = candidates
         .iter()
         .filter(|candidate| host.is_major_compatible_with(candidate))
@@ -592,22 +610,28 @@ fn choose_same_major_mounts(
         .collect::<Vec<_>>();
 
     if same_major_candidates.is_empty() {
+        warnings.push(format!(
+            "no same-major container match found for host library {}; mounting {} into {} with LD_LIBRARY_PATH",
+            host.real_name(),
+            host.path().display(),
+            fallback_dir.display()
+        ));
         return fallback_mount_decision(
             host,
             fallback_dir,
-            Some(format!(
-                "no same-major container match found for host library {}; mounting {} into {} with LD_LIBRARY_PATH fallback",
-                host.real_name(),
-                host.path().display(),
-                fallback_dir.display()
-            )),
+            warnings,
         );
     }
 
-    overwrite_mount_decision(host, &same_major_candidates)
+    overwrite_mount_decision(host, &same_major_candidates, warnings)
 }
 
-fn overwrite_mount_decision(host: &Library, containers: &[Library]) -> Result<MountDecision> {
+// Here we build the mountEdit to overwrite lib with host
+fn overwrite_mount_decision(
+    host: &Library,
+    containers: &[Library],
+    warnings: Vec<String>,
+) -> Result<MountDecision> {
     Ok(MountDecision {
         mounts: containers
             .iter()
@@ -617,14 +641,16 @@ fn overwrite_mount_decision(host: &Library, containers: &[Library]) -> Result<Mo
             })
             .collect(),
         ld_library_path_dir: None,
-        warning: None,
+        warnings,
     })
 }
 
+
+// inject a library through a temporal dir mount containing the right library names as symlinks to the host file, mounts that directory into the container, and tells the dynamic linker to search there
 fn fallback_mount_decision(
     host: &Library,
     _dir: &Path,
-    warning: Option<String>,
+    warnings: Vec<String>,
 ) -> Result<MountDecision> {
     let names = fallback_link_names(host.file_name())?;
     let source = create_fallback_staging_dir(host.path(), &names)?;
@@ -636,7 +662,7 @@ fn fallback_mount_decision(
             destination,
         }],
         ld_library_path_dir,
-        warning,
+        warnings,
     })
 }
 
@@ -729,6 +755,7 @@ fn validate_regular_source_file(source: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
+// INJECTION_EXTRA_FILES are raw file mounts and we need those to be exact
 fn validate_extra_source_file(source: &Path) -> Result<()> {
     let source_metadata = fs::symlink_metadata(source).map_err(|e| {
         Error::io(
@@ -1057,7 +1084,18 @@ mod tests {
             edits.ld_library_path_dirs,
             vec![PathBuf::from("/run/pc-injection/libmpi.so.12.2")]
         );
-        assert_eq!(edits.warnings.len(), 1);
+        assert_eq!(
+            edits.warnings,
+            vec![
+                "skipping same-name container libraries with different major ABI for libmpi.so.12.2: libmpi.so.13.4".to_string(),
+                format!(
+                    "no same-major container match found for host library {}; mounting {} into {} with LD_LIBRARY_PATH fallback",
+                    "libmpi.so.12.2",
+                    host_file.display(),
+                    "/run/pc-injection"
+                ),
+            ]
+        );
 
         fs::remove_dir_all(&temp_root).unwrap();
     }
@@ -1102,7 +1140,56 @@ mod tests {
             ]
         );
         assert!(edits.ld_library_path_dirs.is_empty());
-        assert!(edits.warnings.is_empty());
+        assert_eq!(
+            edits.warnings,
+            vec![
+                "skipping same-name container libraries with different major ABI for libmpi.so.12.5: libmpi.so.11.9".to_string()
+            ]
+        );
+
+        fs::remove_dir_all(&temp_root).unwrap();
+    }
+
+    #[test]
+    fn primary_warns_for_major_mismatch_and_only_overwrites_same_major_candidates() {
+        let temp_root = unique_temp_path("warn-major-mismatch");
+        let rootfs = temp_root.join("rootfs");
+        let host_file = temp_root.join("host/libmpi.so.12.5");
+
+        fs::create_dir_all(rootfs.join("usr/lib64")).unwrap();
+        fs::create_dir_all(rootfs.join("opt/vendor")).unwrap();
+        fs::create_dir_all(host_file.parent().unwrap()).unwrap();
+        fs::write(&host_file, b"payload").unwrap();
+
+        let inputs = HookInputs {
+            rootfs,
+            ldconfig: "ldconfig".into(),
+            primary_libs: vec![Library::parse_host(&host_file).unwrap()],
+            dependency_libs: Vec::new(),
+            extra_files: Vec::new(),
+            _compatibility_policy: CompatibilityPolicy::Major,
+        };
+        let container_libs = vec![
+            Library::parse_host("/usr/lib64/libmpi.so.12.3").unwrap(),
+            Library::parse_host("/opt/vendor/libmpi.so.11.7").unwrap(),
+            Library::parse_host("/usr/lib64/libmpi.so.13.1").unwrap(),
+        ];
+
+        let edits = plan_config_edits(&inputs, &container_libs).unwrap();
+        assert_eq!(
+            edits.mounts,
+            vec![MountEdit {
+                source: host_file.clone(),
+                destination: PathBuf::from("/usr/lib64/libmpi.so.12.3"),
+            }]
+        );
+        assert!(edits.ld_library_path_dirs.is_empty());
+        assert_eq!(
+            edits.warnings,
+            vec![
+                "skipping same-name container libraries with different major ABI for libmpi.so.12.5: libmpi.so.11.7, libmpi.so.13.1".to_string()
+            ]
+        );
 
         fs::remove_dir_all(&temp_root).unwrap();
     }
