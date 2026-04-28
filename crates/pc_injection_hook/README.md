@@ -1,22 +1,27 @@
-# pc_injection_hook
+# Precreate Injection Hook
 
 Precreate hook that plans library injection from the container rootfs and rewrites the OCI config
 to add bind mounts to inject host libs.
 
-## What it does
+## Architecture Overview
 
-* Reads the OCI runtime config from `stdin`.
-* Finds the container rootfs from `root.path`.
-* Discovers container libraries with `ldconfig -r <rootfs> -p`.
-* Plans bind mounts for:
-  * primary libraries from `INJECTION_PRIMARY_LIBS`
-  * optional dependency libraries from `INJECTION_DEPENDENCY_LIBS`
-  * optional extra files from `INJECTION_EXTRA_FILES`
-  * optional extra OCI mounts from `INJECTION_EXTRA_MOUNTS`
-* Appends the required mounts to the OCI config and writes the updated JSON to `stdout`.
-* Adds `LD_LIBRARY_PATH` when the plan injects a runtime library directory instead of
-  overwriting an existing container library path.
-* Merges optional environment variables from `INJECTION_EXTRA_ENV` into `process.env`.
+This hook is architected as a small compiler for OCI specs.
+
+Its lifecycle in main.rs is a five-stage pipeline:
+
+* Read the incoming OCI config JSON from stdin.
+* Load hook inputs from the config plus environment variables.
+* Discover what libraries the container already exposes.
+* Plan a set of safe config edits.
+* Apply those edits and emit a rewritten OCI config to stdout.
+
+The core data model is:
+* HookInputs is the input contract
+* Library keeps the semantic unit of logic: path, parsed linker name, real name, and ABI version
+* ConfigEdits is the planned output: mounts, LD\_LIBRARY\_PATH additions, extra mounts, extra env, and warnings
+
+For each input library, the planning layer makes one decision: overwrite an existing container library path, or inject through a directory and extend LD\_LIBRARY\_PATH
+Always deciding replacement if ABI mayor is respected, otherwise it does directory placement.
 
 ## Notes
 
