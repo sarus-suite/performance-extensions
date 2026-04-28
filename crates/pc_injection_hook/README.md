@@ -20,8 +20,6 @@ to add bind mounts to inject host libs.
 
 ## Notes
 
-* This hook pairs with `ldcache_hook` when it overwrites existing library paths that are
-  already present in the container cache!
 * When the plan introduces new lib injection paths, the hook also updates `LD_LIBRARY_PATH` because a
   prestart `ldconfig -r <rootfs>` run does not see runtime-only bind mounts. New lib injection are
   exposed through a host-side staging directory mounted at `/run/pc-injection/<library>`.
