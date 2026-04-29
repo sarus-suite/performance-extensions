@@ -2,7 +2,7 @@ name: release (use devcontainer + cached)
 
 on:
   push:
-    branches: [ main, archive_artifact ]
+    branches: [ main ]
   workflow_dispatch:            # run manually from the Actions tab
     inputs:
       ref:
