@@ -192,7 +192,7 @@ EOF
       printf "LD_LIBRARY_PATH=%s\n" "${LD_LIBRARY_PATH:-}"
       test -d /run/pc-injection/libpcitest.so.1.0.0
       test -L /run/pc-injection/libpcitest.so.1.0.0/libpcitest.so.1
-      test -L /run/pc-injection/libpcitest.so.1.0.0/libpcitest.so.1.0.0
+      test -f /run/pc-injection/libpcitest.so.1.0.0/libpcitest.so.1.0.0
     '
 
   {
@@ -202,6 +202,70 @@ EOF
 
   assert_success
   assert_output --partial "LD_LIBRARY_PATH=/run/pc-injection/libpcitest.so.1.0.0"
+
+  rm -rf "$workdir" "$hooks_dir"
+}
+
+@test "pc_injection_hook stages symlinked dependency as real file plus alias in Podman" {
+  : "${IMAGE:=ubuntu:24.04}"
+
+  podman pull "$IMAGE" >/dev/null
+
+  run command -v gcc
+  assert_success
+  gcc_path="$output"
+
+  run command -v ldconfig
+  assert_success
+  ldconfig_path="$output"
+
+  run bash -lc '
+    while read -r line; do
+      case "$line" in
+        *"libz.so.1 "*)
+          set -- $line
+          printf "%s\n" "${!#}"
+          exit 0
+          ;;
+      esac
+    done < <(ldconfig -p)
+    exit 1
+  '
+  assert_success
+  assert_output --partial "/"
+  primary_lib="$output"
+
+  workdir="$(mktemp -d)"
+  src="$workdir/libpcisymlink.c"
+  dependency_real="$workdir/libpcisymlink.so.1.0.0"
+  dependency_link="$workdir/libpcisymlink.so.1"
+
+  cat >"$src" <<'EOF'
+int pcisymlink_value(void) { return 42; }
+EOF
+
+  run "$gcc_path" -shared -fPIC -Wl,-soname,libpcisymlink.so.1 -o "$dependency_real" "$src"
+  assert_success
+  ln -s "$(basename "$dependency_real")" "$dependency_link"
+
+  hooks_dir="$(make_pc_injection_hook_dir "$primary_lib" "$dependency_link" "$ldconfig_path")"
+  [ -n "$hooks_dir" ]
+
+  run podman --hooks-dir="$hooks_dir" run --rm \
+    --annotation pc-injection.enable=true \
+    "$IMAGE" bash -lc '
+      test "$LD_LIBRARY_PATH" = "/run/pc-injection/libpcisymlink.so.1" &&
+      test -L /run/pc-injection/libpcisymlink.so.1/libpcisymlink.so.1 &&
+      test -f /run/pc-injection/libpcisymlink.so.1/libpcisymlink.so.1.0.0 &&
+      test "$(readlink /run/pc-injection/libpcisymlink.so.1/libpcisymlink.so.1)" = "libpcisymlink.so.1.0.0"
+    '
+
+  {
+    printf '%s\n' "$output"
+    printf '%s\n' "$stderr"
+  } >&3
+
+  assert_success
 
   rm -rf "$workdir" "$hooks_dir"
 }

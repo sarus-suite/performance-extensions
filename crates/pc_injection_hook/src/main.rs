@@ -584,17 +584,6 @@ fn plan_config_edits(inputs: &HookInputs, container_libs: &[Library]) -> Result<
     let mut warnings = Vec::new();
     let mut ld_library_path_dirs = Vec::new();
 
-    // at least 1 library to inject needs to exist in container
-    if !inputs
-        .primary_libs
-        .iter()
-        .any(|lib| container_index.contains_key(lib.linker_name()))
-    {
-        return Err(Error::message(
-            "failed to activate library injection: no primary libraries found in the container linker cache",
-        ));
-    }
-
     // check injection has major ABI
     for lib in &inputs.primary_libs {
         validate_regular_source_file(lib.path(), "primary library")?;
@@ -783,28 +772,76 @@ fn fallback_mount_decision(
     _dir: &Path,
     warnings: Vec<String>,
 ) -> Result<MountDecision> {
-    let names = fallback_link_names(host.file_name())?;
-    let source = create_fallback_staging_dir(host.path(), &names)?;
+    let fallback = plan_fallback_staging(host.path(), host.file_name())?;
     let destination = PathBuf::from("/run/pc-injection").join(host.file_name());
     let ld_library_path_dir = Some(destination.clone());
     Ok(MountDecision {
-        mounts: vec![MountEdit {
-            source,
-            destination,
-        }],
+        mounts: vec![
+            MountEdit {
+                source: fallback.staging_dir,
+                destination: destination.clone(),
+            },
+            MountEdit {
+                source: fallback.real_source,
+                destination: destination.join(fallback.real_file_name),
+            },
+        ],
         ld_library_path_dir,
         warnings,
     })
 }
 
-fn create_fallback_staging_dir(source: &Path, names: &[String]) -> Result<PathBuf> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FallbackStaging {
+    staging_dir: PathBuf,
+    real_source: PathBuf,
+    real_file_name: String,
+}
+
+fn plan_fallback_staging(source: &Path, requested_name: &str) -> Result<FallbackStaging> {
+    let real_source = canonical_library_source(source)?;
+    let real_file_name = file_name_to_string(&real_source)?;
+    let alias_names = fallback_alias_names(requested_name, &real_file_name)?;
+    let staging_dir = create_fallback_staging_dir(&alias_names, &real_file_name)?;
+
+    Ok(FallbackStaging {
+        staging_dir,
+        real_source,
+        real_file_name,
+    })
+}
+
+fn canonical_library_source(source: &Path) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(source).map_err(|e| {
+        Error::io(
+            format!("failed to stat library source {}", source.display()),
+            e,
+        )
+    })?;
+
+    if metadata.file_type().is_symlink() {
+        fs::canonicalize(source).map_err(|e| {
+            Error::io(
+                format!(
+                    "failed to resolve canonical library source {}",
+                    source.display()
+                ),
+                e,
+            )
+        })
+    } else {
+        Ok(source.to_path_buf())
+    }
+}
+
+fn create_fallback_staging_dir(alias_names: &[String], real_file_name: &str) -> Result<PathBuf> {
     let staging_dir = unique_temp_path("staging");
     fs::create_dir_all(&staging_dir)
         .map_err(|e| Error::io(format!("failed to create {}", staging_dir.display()), e))?;
 
-    for name in names {
+    for name in alias_names {
         let link = staging_dir.join(name);
-        symlink(source, &link).map_err(|e| {
+        symlink(real_file_name, &link).map_err(|e| {
             Error::io(
                 format!("failed to create fallback symlink {}", link.display()),
                 e,
@@ -815,22 +852,42 @@ fn create_fallback_staging_dir(source: &Path, names: &[String]) -> Result<PathBu
     Ok(staging_dir)
 }
 
-fn fallback_link_names(file_name: &str) -> Result<Vec<String>> {
-    let chain = Library::link_chain_names(file_name)?;
-    if chain.len() <= 1 {
-        return Ok(chain);
-    }
-
+fn fallback_alias_names(requested_name: &str, real_file_name: &str) -> Result<Vec<String>> {
     let mut names = Vec::new();
-    if let Some(soname) = chain.get(1) {
-        names.push(soname.clone());
-    }
-    if let Some(real_name) = chain.last() {
-        if names.last() != Some(real_name) {
-            names.push(real_name.clone());
+    let mut seen = HashSet::new();
+
+    for chain in [
+        fallback_link_names(requested_name)?,
+        fallback_link_names(real_file_name)?,
+    ] {
+        for name in chain {
+            if name != real_file_name && seen.insert(name.clone()) {
+                names.push(name);
+            }
         }
     }
+
     Ok(names)
+}
+
+fn fallback_link_names(file_name: &str) -> Result<Vec<String>> {
+    let chain = Library::link_chain_names(file_name)?;
+    match chain.len() {
+        0 => Ok(Vec::new()),
+        1 => Ok(chain),
+        _ => {
+            let mut names = Vec::new();
+            if let Some(soname) = chain.get(1) {
+                names.push(soname.clone());
+            }
+            if let Some(real_name) = chain.last() {
+                if names.last() != Some(real_name) {
+                    names.push(real_name.clone());
+                }
+            }
+            Ok(names)
+        }
+    }
 }
 
 fn index_container_libraries(container_libs: &[Library]) -> HashMap<String, Vec<Library>> {
@@ -1313,13 +1370,18 @@ mod tests {
         let container_libs = vec![Library::parse_host("/usr/lib/libmpi.so.13.4").unwrap()];
 
         let edits = plan_config_edits(&inputs, &container_libs).unwrap();
-        assert_eq!(edits.mounts.len(), 1);
+        assert_eq!(edits.mounts.len(), 2);
         assert_eq!(
             edits.mounts[0].destination,
             PathBuf::from("/run/pc-injection/libmpi.so.12.2")
         );
+        assert_eq!(edits.mounts[1].source, host_file);
+        assert_eq!(
+            edits.mounts[1].destination,
+            PathBuf::from("/run/pc-injection/libmpi.so.12.2/libmpi.so.12.2")
+        );
         assert!(fs::symlink_metadata(edits.mounts[0].source.join("libmpi.so.12")).is_ok());
-        assert!(fs::symlink_metadata(edits.mounts[0].source.join("libmpi.so.12.2")).is_ok());
+        assert!(fs::symlink_metadata(edits.mounts[0].source.join("libmpi.so.12.2")).is_err());
         assert_eq!(
             edits.ld_library_path_dirs,
             vec![PathBuf::from("/run/pc-injection/libmpi.so.12.2")]
@@ -1480,6 +1542,12 @@ mod tests {
                     source: edits.mounts[1].source.clone(),
                     destination: PathBuf::from("/run/pc-injection/libhwloc.so.15.2"),
                 },
+                MountEdit {
+                    source: dependency.clone(),
+                    destination: PathBuf::from(
+                        "/run/pc-injection/libhwloc.so.15.2/libhwloc.so.15.2"
+                    ),
+                },
             ]
         );
         assert_eq!(
@@ -1494,7 +1562,31 @@ mod tests {
             )]
         );
         assert!(fs::symlink_metadata(edits.mounts[1].source.join("libhwloc.so.15")).is_ok());
-        assert!(fs::symlink_metadata(edits.mounts[1].source.join("libhwloc.so.15.2")).is_ok());
+        assert!(fs::symlink_metadata(edits.mounts[1].source.join("libhwloc.so.15.2")).is_err());
+
+        fs::remove_dir_all(&temp_root).unwrap();
+    }
+
+    #[test]
+    fn symlink_dependency_stages_real_file_and_relative_alias() {
+        let temp_root = unique_temp_path("symlink-dependency");
+        let primary = temp_root.join("host/libmpi.so.12.5");
+        let dependency_real = temp_root.join("host/libcxi.so.1.5.0");
+        let dependency_link = temp_root.join("host/libcxi.so.1");
+
+        fs::create_dir_all(primary.parent().unwrap()).unwrap();
+        fs::write(&primary, b"payload").unwrap();
+        fs::write(&dependency_real, b"payload").unwrap();
+        symlink("libcxi.so.1.5.0", &dependency_link).unwrap();
+
+        let fallback = plan_fallback_staging(&dependency_link, "libcxi.so.1").unwrap();
+        assert_eq!(fallback.real_source, dependency_real);
+        assert_eq!(fallback.real_file_name, "libcxi.so.1.5.0");
+        assert_eq!(
+            fs::read_link(fallback.staging_dir.join("libcxi.so.1")).unwrap(),
+            PathBuf::from("libcxi.so.1.5.0")
+        );
+        assert!(fs::symlink_metadata(fallback.staging_dir.join("libcxi.so.1.5.0")).is_err());
 
         fs::remove_dir_all(&temp_root).unwrap();
     }
