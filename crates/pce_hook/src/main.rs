@@ -22,7 +22,6 @@ struct Precreate {
     container_edits: Vec<ContainerEdit>,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ContainerEdit {
@@ -32,7 +31,6 @@ struct ContainerEdit {
     #[serde(default)]
     mounts: Vec<Mount>,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,7 +45,6 @@ struct Mount {
     options: Option<Vec<String>>,
 }
 
-
 fn main() -> io::Result<()> {
     // we go for run
     if let Err(e) = run() {
@@ -60,7 +57,6 @@ fn main() -> io::Result<()> {
 
     Ok(())
 }
-
 
 fn run() -> Result<(), String> {
     // Read and parse stdin JSON
@@ -81,18 +77,19 @@ fn run() -> Result<(), String> {
 
     // Pretty-print output JSON with trailing newline
     let mut stdout = io::stdout().lock();
- 
+
     serde_json::to_writer_pretty(&mut stdout, &value)
         .map_err(|e| format!("Failed to write JSON to stdout: {e}"))?;
 
     stdout
         .write_all(b"\n")
         .map_err(|e| format!("Failed to write newline to stdout: {e}"))?;
-    stdout.flush().map_err(|e| format!("Failed to flush stdout: {e}"))?;
+    stdout
+        .flush()
+        .map_err(|e| format!("Failed to flush stdout: {e}"))?;
 
     Ok(())
 }
-
 
 // Precreate takes as stdin the container config json
 // We return error if we cannot read or
@@ -104,10 +101,8 @@ fn read_stdin_json() -> Result<Value, String> {
         .read_to_string(&mut input)
         .map_err(|e| format!("Failed to read from stdin: {e}"))?;
 
-    serde_json::from_str(&input)
-        .map_err(|e| format!("Invalid JSON: {e}"))
+    serde_json::from_str(&input).map_err(|e| format!("Invalid JSON: {e}"))
 }
-
 
 // Reading for precreate container edits input
 // we try to read the input file
@@ -126,8 +121,8 @@ fn read_pce_input() -> Result<(Vec<Mount>, Vec<String>), String> {
         .map_err(|e| format!("PCE_INPUT: fail to read {}: {}", path, e))?;
 
     // parse into json
-    let pre: Precreate = serde_json::from_str(&s)
-        .map_err(|e| format!("PCE_INPUT: Invalid JSON: {e}"))?;
+    let pre: Precreate =
+        serde_json::from_str(&s).map_err(|e| format!("PCE_INPUT: Invalid JSON: {e}"))?;
 
     // extract mounts and envs
     let mut mounts = Vec::new();
@@ -140,17 +135,13 @@ fn read_pce_input() -> Result<(Vec<Mount>, Vec<String>), String> {
     Ok((mounts, envs))
 }
 
-
 /// Ensure a `Value` is an object and return it as a mutable map.
 fn ensure_obj<'a>(
     candidate: Option<&'a mut Map<String, Value>>,
     err: &str,
 ) -> Result<&'a mut Map<String, Value>, String> {
-
     candidate.ok_or_else(|| format!("Validation error: {err}."))
-
 }
-
 
 // Manual write of mount block as cdi and container config formats dont match
 fn append_mounts(obj: &mut Map<String, Value>, mounts_to_add: Vec<Mount>) -> Result<(), String> {
@@ -191,7 +182,6 @@ fn append_mounts(obj: &mut Map<String, Value>, mounts_to_add: Vec<Mount>) -> Res
 //    Ok(())
 //}
 
-
 fn ensure_array_field<'a>(
     obj: &'a mut Map<String, Value>,
     field: &str,
@@ -212,12 +202,13 @@ fn ensure_array_field<'a>(
             let v = e.into_mut(); // &'a mut Value
             match v {
                 Value::Array(ref mut arr) => Ok(arr),
-                _ => Err(format!("Validation error: '{field}' exists but is not an array.")),
+                _ => Err(format!(
+                    "Validation error: '{field}' exists but is not an array."
+                )),
             }
         }
     }
 }
-
 
 /// Validate a list of "KEY=value" strings.
 fn validate_env_strings(entries: Vec<String>) -> Result<Vec<String>, String> {
@@ -227,7 +218,6 @@ fn validate_env_strings(entries: Vec<String>) -> Result<Vec<String>, String> {
 
     Ok(entries)
 }
-
 
 fn validate_kv_format(s: &str) -> Result<(), String> {
     if let Some((k, _v)) = s.split_once('=') {
@@ -239,7 +229,6 @@ fn validate_kv_format(s: &str) -> Result<(), String> {
         Err(format!("Invalid env entry (expected KEY=VALUE): {s}"))
     }
 }
-
 
 // merging envs into the container config json is as follows
 // 1. we need to add envs into the process object
@@ -253,7 +242,9 @@ fn merge_process_env_strings(
     env_entries: Vec<String>,
 ) -> Result<(), String> {
     // Ensure "process" is an object
-    let process_val = obj.entry("process".to_string()).or_insert_with(|| json!({}));
+    let process_val = obj
+        .entry("process".to_string())
+        .or_insert_with(|| json!({}));
     let process_obj = process_val
         .as_object_mut()
         .ok_or_else(|| "Validation error: 'process' exists but is not an object.".to_string())?;
@@ -279,4 +270,3 @@ fn merge_process_env_strings(
 
     Ok(())
 }
-

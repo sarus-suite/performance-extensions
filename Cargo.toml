@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/pce_hook", "crates/mps_hook", "crates/ldcache_hook"]
+members = [
+    "crates/pce_hook",
+    "crates/mps_hook",
+    "crates/ldcache_hook",
+    "crates/pc_injection_hook",
+]
 resolver = "2"
 
 [profile.release]
