@@ -12,7 +12,7 @@ Update container environment replacing HOME variable for running user with the o
 
 ## Usage as a Podman hook
 
-Add a createContainer hook entry similar to:
+Add a `precreate` hook entry similar to:
 
 ```json
 {
