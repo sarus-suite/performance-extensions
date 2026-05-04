@@ -3,7 +3,7 @@ use std::{
     process,
 };
 
-use serde_json::{Map, Value, json};
+use serde_json::{Map, map::Entry, Value, json};
 use users::get_user_by_uid;
 use users::os::unix::UserExt;
 
@@ -55,32 +55,48 @@ fn run() -> Result<(), String> {
 // 3. get homedir from user entry
 // 4. build HOME entry string and return it
 fn get_home_env_entry(obj: &mut Map<String, Value>) -> Result<String, String> {
+
+    // Ensure "process" exists
+    let process_val = obj.entry("process".to_string());
+    match process_val {
+        Entry::Vacant(_) => return Err(format!("Validation error: 'process' doesn't exist.")),
+        Entry::Occupied(_) => {},
+    }
+
     // Ensure "process" is an object
-    let process_val = obj
-        .entry("process".to_string())
-        .or_insert_with(|| json!({}));
     let process_obj = process_val
+        .or_insert_with(|| json!({}))
         .as_object_mut()
         .ok_or_else(|| "Validation error: 'process' exists but is not an object.".to_string())?;
 
-    // Ensure "user" is an object
-    let user_val = process_obj
-        .entry("user".to_string())
-        .or_insert_with(|| json!({}));
+    // Ensure "user" exists
+    let user_val = process_obj.entry("user".to_string());
+    match user_val {
+        Entry::Vacant(_) => return Err(format!("Validation error: 'process.user' doesn't exist.")),
+        Entry::Occupied(_) => {},
+    }
+
     let user_obj = user_val
+        .or_insert_with(|| json!({}))
         .as_object_mut()
-        .ok_or_else(|| "Validation error: 'user' exists but is not an object.".to_string())?;
+        .ok_or_else(|| "Validation error: 'process.user' exists but is not an object.".to_string())?;
+
+    // Ensure "uid" exists
+    let uid_val = user_obj.entry("uid".to_string());
+    match uid_val {
+        Entry::Vacant(_) => return Err(format!("Validation error: 'process.user.uid' doesn't exist.")),
+        Entry::Occupied(_) => {},
+    }
 
     // Ensure "uid" is a number
-    let uid: u32 = user_obj
-        .entry("uid".to_string())
+    let uid: u32 = uid_val
         .or_insert_with(|| json!(0))
         .as_number()
-        .ok_or_else(|| "Validation error: 'uid' exists but is not a number.".to_string())?
+        .ok_or_else(|| "Validation error: 'process.user.uid' exists but is not a number.".to_string())?
         .as_u64()
-        .ok_or_else(|| "Validation error: 'uid' is a number but doesn't fit u64.".to_string())?
+        .ok_or_else(|| "Validation error: 'process.user.uid' is a number but doesn't fit u64.".to_string())?
         .try_into()
-        .map_err(|e| format!("Validation error: 'uid' is a number but doesn't fit u32: {e}"))?;
+        .map_err(|e| format!("Validation error: 'process.user.uid' is a number but doesn't fit u32: {e}"))?;
 
     let user = get_user_by_uid(uid)
         .ok_or_else(|| "Unknown UID: cannot find User by UID {uid}".to_string())
