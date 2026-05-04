@@ -21,6 +21,6 @@ Add a prestart hook entry similar to:
   "when": {
     "always": true
   },
-  "stages": ["prestart"]
+  "stages": ["createRuntime"]
 }
 ```
