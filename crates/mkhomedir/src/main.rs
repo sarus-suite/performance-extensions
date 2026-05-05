@@ -142,7 +142,7 @@ fn update_etc_passwd(root: &Path, uid: uid_t, home: &Path) -> Result<(), String>
                 .as_os_str()
                 .to_os_string()
                 .into_string()
-                .map_err(|e| format!("failed to convert osstring: {}", e.display()))?;
+                .map_err(|e| format!("failed to convert osstring: {:#?}", e))?;
 
             if cur_home != new_home {
                 for (pos, value) in split.iter().enumerate() {
