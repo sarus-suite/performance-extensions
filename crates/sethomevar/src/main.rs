@@ -98,9 +98,10 @@ fn get_home_env_entry(obj: &mut Map<String, Value>) -> Result<String, String> {
         .try_into()
         .map_err(|e| format!("Validation error: 'process.user.uid' is a number but doesn't fit u32: {e}"))?;
 
-    let user = get_user_by_uid(uid)
-        .ok_or_else(|| "Unknown UID: cannot find User by UID {uid}".to_string())
-        .unwrap();
+    let user = match get_user_by_uid(uid) {
+        Some(u) => u,
+        None => return Err(format!("Unknown UID: cannot find User by UID {uid}")),
+    };
     let homedir = user.home_dir().display();
 
     let home_env_entry = format!("HOME={homedir}");
