@@ -1,11 +1,9 @@
 use std::{
     io::{self, Read, Write},
-    process,
+    process::{self, Command},
 };
 
 use serde_json::{Map, map::Entry, Value, json};
-use users::get_user_by_uid;
-use users::os::unix::UserExt;
 
 fn main() -> io::Result<()> {
     // we go for run
@@ -98,11 +96,28 @@ fn get_home_env_entry(obj: &mut Map<String, Value>) -> Result<String, String> {
         .try_into()
         .map_err(|e| format!("Validation error: 'process.user.uid' is a number but doesn't fit u32: {e}"))?;
 
-    let user = match get_user_by_uid(uid) {
-        Some(u) => u,
-        None => return Err(format!("Unknown UID: cannot find User by UID {uid}")),
+    let getent_out = match Command::new("getent")
+                       .args(&["passwd", uid.to_string().as_str()])
+                       .output() {
+        Ok(process) => process,
+        Err(err)    => return Err(format!("Running command error: getent passwd {uid}: {err}")),
     };
-    let homedir = user.home_dir().display();
+
+    if ! getent_out.status.success() {
+        let code = getent_out.status.code().unwrap();
+        return Err(format!("Exit command error: getent passwd {uid} returned: {code}"));
+    };
+
+    let getent_stdout = match std::string::String::from_utf8(getent_out.stdout) {
+        Ok(out)  => out,
+        Err(err) => return Err(format!("Translating output command error: getent passwd {uid}: {err}")),
+    };
+
+    let getent_stdout_vec: Vec<&str> = getent_stdout.split(':').collect();
+    let homedir = match getent_stdout_vec.get(5) {
+        Some(s) => s,
+        None => return Err(format!("Output command error: getent passwd {uid}, cannot find homedir field.")),
+    };
 
     let home_env_entry = format!("HOME={homedir}");
 
