@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/pce_hook", "crates/mps_hook", "crates/ldcache_hook", "crates/mkhomedir"]
+members = ["crates/pce_hook", "crates/mps_hook", "crates/ldcache_hook", "crates/mkhomedir", "crates/sethomevar"]
 resolver = "2"
 
 [profile.release]
