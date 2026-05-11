@@ -193,16 +193,20 @@ fn load_inputs(config: &Value) -> Result<HookInputs> {
         .and_then(Value::as_str)
         .ok_or_else(|| Error::message("OCI config is missing root.path"))?;
 
-    Ok(HookInputs {
+    let inputs = HookInputs {
         rootfs: resolve_rootfs(root_path)?,
         ldconfig: PathBuf::from(env::var_os("LDCONFIG_PATH").unwrap_or_else(|| "ldconfig".into())),
-        primary_libs: parse_required_library_list("INJECTION_PRIMARY_LIBS")?,
+        primary_libs: parse_optional_library_list("INJECTION_PRIMARY_LIBS")?,
         dependency_libs: parse_optional_library_list("INJECTION_DEPENDENCY_LIBS")?,
         extra_files: parse_optional_path_list("INJECTION_EXTRA_FILES"),
         extra_mounts: parse_optional_mount_specs("INJECTION_EXTRA_MOUNTS")?,
         extra_env: parse_optional_env_specs("INJECTION_EXTRA_ENV")?,
         _compatibility_policy: CompatibilityPolicy::from_env("INJECTION_COMPATIBILITY")?,
-    })
+    };
+
+    validate_inputs(&inputs)?;
+
+    Ok(inputs)
 }
 
 fn resolve_rootfs(root_path: &str) -> Result<PathBuf> {
@@ -216,23 +220,6 @@ fn resolve_rootfs(root_path: &str) -> Result<PathBuf> {
     )))
 }
 
-fn parse_required_library_list(var: &'static str) -> Result<Vec<Library>> {
-    let raw = env::var_os(var).ok_or_else(|| {
-        Error::message(format!(
-            "the environment variable {var} is expected to be a non-empty colon-separated list of paths"
-        ))
-    })?;
-
-    let paths: Vec<_> = env::split_paths(&raw).collect();
-    if paths.is_empty() {
-        return Err(Error::message(format!(
-            "the environment variable {var} is expected to be a non-empty colon-separated list of paths"
-        )));
-    }
-
-    paths.into_iter().map(Library::parse_host).collect()
-}
-
 fn parse_optional_library_list(var: &'static str) -> Result<Vec<Library>> {
     match env::var_os(var) {
         Some(value) if !value.is_empty() => {
@@ -240,6 +227,16 @@ fn parse_optional_library_list(var: &'static str) -> Result<Vec<Library>> {
         }
         _ => Ok(Vec::new()),
     }
+}
+
+fn validate_inputs(inputs: &HookInputs) -> Result<()> {
+    if inputs.primary_libs.is_empty() && inputs.dependency_libs.is_empty() {
+        return Err(Error::message(
+            "at least one of INJECTION_PRIMARY_LIBS or INJECTION_DEPENDENCY_LIBS must be non-empty",
+        ));
+    }
+
+    Ok(())
 }
 
 fn parse_optional_path_list(var: &'static str) -> Vec<PathBuf> {
@@ -1768,6 +1765,40 @@ mod tests {
         );
 
         std::env::remove_var("INJECTION_EXTRA_MOUNTS");
+        fs::remove_dir_all(&temp_root).unwrap();
+    }
+
+    #[test]
+    fn validate_inputs_allows_dependency_only_and_rejects_empty_library_inputs() {
+        let base = HookInputs {
+            rootfs: PathBuf::from("/rootfs"),
+            ldconfig: "ldconfig".into(),
+            primary_libs: Vec::new(),
+            dependency_libs: Vec::new(),
+            extra_files: Vec::new(),
+            extra_mounts: Vec::new(),
+            extra_env: Vec::new(),
+            _compatibility_policy: CompatibilityPolicy::Major,
+        };
+
+        let error = validate_inputs(&base).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "at least one of INJECTION_PRIMARY_LIBS or INJECTION_DEPENDENCY_LIBS must be non-empty"
+        );
+
+        let temp_root = unique_temp_path("validate-inputs-dependency-only");
+        let dependency = temp_root.join("host/libcxi.so.1.5.0");
+        fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+        fs::write(&dependency, b"payload").unwrap();
+
+        let dependency_only = HookInputs {
+            dependency_libs: vec![Library::parse_host(&dependency).unwrap()],
+            ..base
+        };
+
+        assert!(validate_inputs(&dependency_only).is_ok());
+
         fs::remove_dir_all(&temp_root).unwrap();
     }
 }
