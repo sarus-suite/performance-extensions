@@ -1,0 +1,137 @@
+#!/bin/bash
+#
+# Create a reference template for Progressive File Layout on a Lustre filesystem
+#
+
+ARGS="$@"
+SCRIPTNAME=$(basename $0)
+LFS_CMD="/usr/bin/lfs"
+TIMEOUT="10"
+SBIN_DIR=$(readlink -f "$(dirname $0)")
+ETC_DIR=$(readlink  -f "${SBIN_DIR}/../etc")
+
+function help() {
+  cat >&2 << EOF
+
+  This script creates a reference template for lustre progressive file layout
+  on a specific lustre filesystem and saves it at:
+  ${ETC_DIR}
+
+  Usage: ${SCRIPTNAME} <lfs setstripe options> <target directory on lustre>
+
+EOF
+}
+
+
+# Check dependencies
+[ ! -x /usr/bin/timeout ] && echo "ERROR: missing /usr/bin/timeout" >&2 && exit 1
+[ ! -x /usr/bin/dirname ] && echo "ERROR: missing /usr/bin/dirname" >&2 && exit 1
+[ ! -x /usr/bin/findmnt ] && echo "ERROR: missing /usr/bin/findmnt" >&2 && exit 1
+[ ! -x ${LFS_CMD}       ] && echo "ERROR: missing ${LFS_CMD}"       >&2 && exit 1
+[ ! -x /usr/bin/yq      ] && echo "ERROR: missing /usr/bin/yq"      >&2 && exit 1
+[ ! -x /usr/bin/jq      ] && echo "ERROR: missing /usr/bin/jq"      >&2 && exit 1
+[ ! -x /usr/bin/diff    ] && echo "ERROR: missing /usr/bin/diff"    >&2 && exit 1
+[ ! -x /usr/bin/rmdir   ] && echo "ERROR: missing /usr/bin/rmdir"   >&2 && exit 1
+[ ! -x /usr/bin/mktemp  ] && echo "ERROR: missing /usr/bin/mktemp"  >&2 && exit 1
+
+if [ ! -d "${ETC_DIR}" ]
+then
+  mkdir -p "${ETC_DIR}"
+  [ ! -d "${ETC_DIR}" ] && echo "ERROR: cannot create \"${ETC_DIR}\"" >&2 && exit 1
+fi
+
+PARENT_DIR="${ARGS##* }"
+LFS_SETSTRIPE_OPTS="${ARGS% *}"
+
+if [ -z "${PARENT_DIR}" ] || [ -z "${LFS_SETSTRIPE_OPTS}" ] 
+then
+  echo "ERROR: you must specify \"lfs setstripe\" options and a directory path on a target Lustre filesystem" >&2
+  help
+  exit 1
+fi
+
+if [ ! -d "${PARENT_DIR}" ]
+then
+  echo "ERROR: \"${PARENT_DIR}\" is not a directory" >&2
+  exit 1
+fi
+
+FSTYPE=$(/usr/bin/timeout $TIMEOUT /usr/bin/findmnt -n -o fstype --target "${PARENT_DIR}")
+if [ "${FSTYPE}" != "lustre" ]
+then
+  echo "ERROR: \"${PARENT_DIR}\" is not a on a lustre filesystem" >&2
+  exit 1
+fi
+
+FSNAME=$(/usr/bin/timeout $TIMEOUT ${LFS_CMD} getname -n "${PARENT_DIR}")
+if [ $? -ne 0 ]
+then
+  echo "ERROR: Cannot retrieve filesystem name for \"${PARENT_DIR}\", rc=$?" >&2
+  exit 1
+fi
+
+# Create directory
+TARGET_DIR=$(/usr/bin/mktemp -d -p "${PARENT_DIR}" pfl_template_XXX)
+RC=$?
+if [ ! -d "${TARGET_DIR}" ]
+then
+  echo "ERROR: Cannot create directory at \"${TARGET_DIR}\", rc=$RC" >&2
+  exit 1
+fi
+PFL_REFERENCE="${ETC_DIR}/${FSNAME}_pfl_reference.json"
+PFL_SETSTRIPE_OPTS_ENV="${ETC_DIR}/${FSNAME}_pfl_setstripe_opts.env"
+
+# Set Striping
+/usr/bin/timeout ${TIMEOUT} ${LFS_CMD} setstripe ${LFS_SETSTRIPE_OPTS} ${TARGET_DIR}
+RC=$?
+if [ $RC -ne 0 ]
+then
+  echo "ERROR: \"timeout $TIMEOUT lfs setstripe\" returned: $RC" >&2
+  exit 1
+fi
+
+# Collect pfl.layout
+/usr/bin/timeout ${TIMEOUT} ${LFS_CMD} getstripe -y -d ${TARGET_DIR} | \
+	/usr/bin/yq r - -j -P | \
+	/usr/bin/jq 'with_entries(if (.key | test("component[0-9]$")) then ({key: .key, value: del(.value.sub_layout.lmm_objects)}) else ({key: .key, value: .value}) end)' \
+	> ${PFL_REFERENCE}
+RC=$?
+if [ $RC -ne 0 ]
+then
+  echo "ERROR: \"timeout $TIMEOUT lfs getstripe\" returned: $RC" >&2
+  exit 1
+fi
+if [ ! -f "${PFL_REFERENCE}" ]
+then
+  echo "ERROR: \"${PFL_REFERENCE}\" was not created." >&2
+  exit 1
+else
+  echo "Created \"${PFL_REFERENCE}\""
+fi
+
+# Save lfs setstripe opts
+echo "export LFS_SETSTRIPE_OPTS=\"${LFS_SETSTRIPE_OPTS}\"" > ${PFL_SETSTRIPE_OPTS_ENV}
+RC=$?
+if [ $RC -ne 0 ]
+then
+  echo "ERROR: Cannot create \"${PFL_SETSTRIPE_OPTS_ENV}\", rc: $RC" >&2
+  exit 1
+fi
+if [ ! -f "${PFL_SETSTRIPE_OPTS_ENV}" ]
+then
+  echo "ERROR: \"${PFL_SETSTRIPE_OPTS_ENV}\" was not created." >&2
+  exit 1
+else
+  echo "Created \"${PFL_SETSTRIPE_OPTS_ENV}\""
+fi
+
+# Remove TARGET_DIR
+/usr/bin/rmdir ${TARGET_DIR}
+RC=$?
+if [ $RC -ne 0 ]
+then
+  echo "ERROR: Cannot remove \"${TARGET_DIR}\", rc: $RC" >&2
+  exit 1
+fi
+
+exit 0

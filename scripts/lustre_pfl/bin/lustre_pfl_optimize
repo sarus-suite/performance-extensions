@@ -1,0 +1,158 @@
+#!/bin/bash
+#
+# Optimize a directory and its content agains progressive file layout reference file schema.
+#
+
+TARGET_DIR=$1
+BIN_DIR=$(readlink -f "$(dirname $0)")
+ETC_DIR=$(readlink -f "${BIN_DIR}/../etc")
+LFS_CMD="/usr/bin/lfs"
+TIMEOUT="10"
+TMP_DIR="/tmp"
+
+# Check dependencies
+[ ! -x /usr/bin/timeout ] && echo "ERROR: missing /usr/bin/timeout" >&2 && exit 1
+[ ! -x /usr/bin/dirname ] && echo "ERROR: missing /usr/bin/dirname" >&2 && exit 1
+[ ! -x /usr/bin/findmnt ] && echo "ERROR: missing /usr/bin/findmnt" >&2 && exit 1
+[ ! -x ${LFS_CMD}       ] && echo "ERROR: missing ${LFS_CMD}"       >&2 && exit 1
+[ ! -x /usr/bin/yq      ] && echo "ERROR: missing /usr/bin/yq"      >&2 && exit 1
+[ ! -x /usr/bin/jq      ] && echo "ERROR: missing /usr/bin/jq"      >&2 && exit 1
+[ ! -x /usr/bin/diff    ] && echo "ERROR: missing /usr/bin/diff"    >&2 && exit 1
+[ ! -x /usr/bin/rsync   ] && echo "ERROR: missing /usr/bin/rsync"   >&2 && exit 1
+
+MIGRATING_DIR="${TARGET_DIR}.optimizing"
+
+function rename_directory() {
+  mv ${MIGRATING_DIR} ${TARGET_DIR}
+  RC=$?
+  if [ $RC -ne 0 ]
+  then
+    echo "ERROR: mv ${MIGRATING_DIR} ${TARGET_DIR} returned: $RC" >&2
+    echo "Optimization crashed. Target directory is in an undefined state. Please run \"${0}\" again." >&2
+    return 1
+  fi
+}
+
+if [ -z "${TARGET_DIR}" ]
+then
+  echo "ERROR: you must specify lustre directory path" >&2
+  exit 1
+fi
+
+if [ ! -d "${TARGET_DIR}" ] 
+then
+  if [ -d "${MIGRATING_DIR}" ]
+  then
+    rename_directory || exit $?
+  else
+    echo "ERROR: target directory \"${TARGET_DIR}\" doesn't exist" >&2
+    exit 1
+  fi
+fi
+
+# check filesystem type
+FSTYPE=$(/usr/bin/timeout $TIMEOUT findmnt -n -o fstype --target "${TARGET_DIR}") 
+if [ "${FSTYPE}" != "lustre" ]
+then
+  echo "ERROR: target directory \"${TARGET_DIR}\" isn't on a LUSTRE filesystem. Cannot optimize." >&2
+  exit 1
+fi
+
+FSNAME=$(/usr/bin/timeout $TIMEOUT ${LFS_CMD} getname -n "${TARGET_DIR}")
+if [ $? -ne 0 ]
+then
+  echo "ERROR: Cannot retrieve filesystem name for \"${TARGET_DIR}\", rc=$?" >&2
+  exit 1
+fi
+
+PFL_LAYOUT_REFERENCE="${ETC_DIR}/${FSNAME}_pfl_reference.json"
+PFL_SETSTRIPE_OPTS_ENV="${ETC_DIR}/${FSNAME}_pfl_setstripe_opts.env"
+
+if [ ! -f "${PFL_LAYOUT_REFERENCE}" ]
+then
+  echo "ERROR: Missing Progressive File layout reference file \"${PFL_LAYOUT_REFERENCE}\"" >&2
+  exit 1
+fi
+
+if [ ! -f "${PFL_SETSTRIPE_OPTS_ENV}" ]
+then
+  echo "ERROR: Missing Progressive File layout environment file \"${PFL_SETSTRIPE_OPTS_ENV}\"" >&2
+  exit 1
+fi
+
+. ${PFL_SETSTRIPE_OPTS_ENV}
+
+if [ -z "${LFS_SETSTRIPE_OPTS}" ]
+then
+  echo "ERROR: Missing LFS_SETSTRIPE_OPTS environment variable " >&2
+  exit 1
+fi
+
+# Collect pfl.layout
+PFL_LAYOUT_TEMPLATE="${TMP_DIR}/pfl_layout.json.XXX"
+PFL_LAYOUT_OUTPUT=$(mktemp ${PFL_LAYOUT_TEMPLATE})
+/usr/bin/timeout ${TIMEOUT} ${LFS_CMD} getstripe -y -d ${TARGET_DIR} | \
+	/usr/bin/yq r - -j -P | \
+	/usr/bin/jq 'with_entries(if (.key | test("component[0-9]$")) then ({key: .key, value: del(.value.sub_layout.lmm_objects)}) else ({key: .key, value: .value}) end)' \
+	> ${PFL_LAYOUT_OUTPUT}
+RC=$?
+if [ $RC -ne 0 ]
+then
+  echo "ERROR: \"timeout $TIMEOUT lfs getstripe\" returned: $RC" >&2
+  exit 1
+fi
+
+/usr/bin/diff -q ${PFL_LAYOUT_REFERENCE} ${PFL_LAYOUT_OUTPUT} &>/dev/null
+RC=$?
+if [ $RC -eq 0 ]
+then
+  echo "ERROR: target directory \"${TARGET_DIR}\" is already optmized. Nothing to do." >&2
+  exit 1
+fi
+rm -f ${PFL_LAYOUT_OUTPUT}
+
+if [ -d "${MIGRATING_DIR}" ]
+then
+  echo "RECOVERING Temporary Directory at ${MIGRATING_DIR}"
+else
+  mkdir -p "${MIGRATING_DIR}"
+  RC=$?
+  if [ $RC -ne 0 ]
+  then
+    echo "ERROR: mkdir -p \"${MIGRATING_DIR}\" returned: $RC" >&2
+    exit 1
+  fi
+  echo "CREATED New Temporary Directory at ${MIGRATING_DIR}"
+fi
+
+/usr/bin/timeout ${TIMEOUT} ${LFS_CMD} setstripe ${LFS_SETSTRIPE_OPTS} ${MIGRATING_DIR}
+RC=$?
+if [ $RC -ne 0 ]
+then
+  rmdir ${MIGRATING_DIR}
+  echo "ERROR: \"timeout $TIMEOUT lfs setstripe\" returned: $RC" >&2
+  exit 1
+fi
+ 
+echo "Moving data from ${TARGET_DIR} to ${MIGRATING_DIR}"
+/usr/bin/rsync -av --remove-source-files ${TARGET_DIR}/ ${MIGRATING_DIR}/
+RC=$?
+if [ $RC -ne 0 ]
+then
+  echo "ERROR: rsync -av --delete ${TARGET_DIR}/ ${MIGRATING_DIR}/ returned: $RC" >&2
+  echo "Optimization crashed. Target directory is in an undefined state. Please run \"${0}\" again." >&2
+  exit 1
+fi
+
+find ${TARGET_DIR}/ -type d -empty -delete
+RC=$?
+if [ $RC -ne 0 ]
+then
+  echo "ERROR: find ${TMP_DIR} -type d -empty -delete, returned: $RC" >&2
+  echo "Optimization crashed. Target directory is currently in an undefined state. Please run \"${0}\" again." >&2
+  exit 1
+fi
+
+rename_directory || exit $?
+
+exit 0

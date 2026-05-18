@@ -63,6 +63,10 @@ jobs:
               cp target/release/mkhomedir "dist/hooks-${{ matrix.arch }}/mkhomedir-${{ github.ref_name }}"
               tar -C dist/hooks-${{ matrix.arch }} -czf "dist/hooks-${{ matrix.arch }}.tar.gz" .
               ls -lah target/release/
+              mkdir -p dist/scripts
+              cp -a scripts/lustre_pfl/bin dist/scripts/
+              cp -a scripts/lustre_pfl/sbin dist/scripts/
+              tar -C dist/scripts -czf "dist/scripts.tar.gz" .
               ls -lah dist/
             '
 
@@ -71,5 +75,13 @@ jobs:
         with:
           name: hooks-${{ matrix.arch }}
           path: dist/hooks-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+          archive: false
+      
+      - name: Upload scripts archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: scripts
+          path: dist/scripts.tar.gz
           if-no-files-found: error
           archive: false
