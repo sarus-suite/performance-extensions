@@ -56,11 +56,11 @@ jobs:
             bash -lc '
               cargo build --release
               mkdir -p dist/hooks-${{ matrix.arch }}
-              cp target/release/ldcache_hook "dist/hooks-${{ matrix.arch }}/ldcache_hook-${{ github.ref_name }}"
-              cp target/release/pce_hook "dist/hooks-${{ matrix.arch }}/pce_hook-${{ github.ref_name }}"
-              cp target/release/mps_hook "dist/hooks-${{ matrix.arch }}/mps_hook-${{ github.ref_name }}"
-              cp target/release/sethomevar "dist/hooks-${{ matrix.arch }}/sethomevar-${{ github.ref_name }}"
-              cp target/release/mkhomedir "dist/hooks-${{ matrix.arch }}/mkhomedir-${{ github.ref_name }}"
+              cp target/release/ldcache_hook "dist/hooks-${{ matrix.arch }}/ldcache_hook
+              cp target/release/pce_hook "dist/hooks-${{ matrix.arch }}/pce_hook
+              cp target/release/mps_hook "dist/hooks-${{ matrix.arch }}/mps_hook
+              cp target/release/sethomevar "dist/hooks-${{ matrix.arch }}/sethomevar
+              cp target/release/mkhomedir "dist/hooks-${{ matrix.arch }}/mkhomedir
               tar -C dist/hooks-${{ matrix.arch }} -czf "dist/hooks-${{ matrix.arch }}.tar.gz" .
               ls -lah target/release/
               ls -lah dist/
