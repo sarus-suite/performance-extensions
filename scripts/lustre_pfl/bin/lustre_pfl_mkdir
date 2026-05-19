@@ -1,0 +1,148 @@
+#!/bin/bash
+#
+# Create and Check directory against Lustre progressive file layout reference.
+#
+
+TARGET_DIR=$1
+BIN_DIR=$(readlink -f "$(dirname $0)")
+ETC_DIR=$(readlink -f "${BIN_DIR}/../etc")
+LFS_CMD="/usr/bin/lfs"
+TIMEOUT="10"
+TMP_DIR="/tmp"
+
+# Check dependencies
+[ ! -x /usr/bin/timeout ] && echo "ERROR: missing /usr/bin/timeout" >&2 && exit 1
+[ ! -x /usr/bin/dirname ] && echo "ERROR: missing /usr/bin/dirname" >&2 && exit 1
+[ ! -x /usr/bin/findmnt ] && echo "ERROR: missing /usr/bin/findmnt" >&2 && exit 1
+[ ! -x ${LFS_CMD}       ] && echo "ERROR: missing ${LFS_CMD}"       >&2 && exit 1
+[ ! -x /usr/bin/yq      ] && echo "ERROR: missing /usr/bin/yq"      >&2 && exit 1
+[ ! -x /usr/bin/jq      ] && echo "ERROR: missing /usr/bin/jq"      >&2 && exit 1
+[ ! -x /usr/bin/diff    ] && echo "ERROR: missing /usr/bin/diff"    >&2 && exit 1
+
+if [ -z "${TARGET_DIR}" ]
+then
+  echo "ERROR: you must specify a target directory path" >&2
+  exit 1
+fi
+
+if [ ! -e "${TARGET_DIR}" ]
+then
+  NEED_DIR_CREATION="true"
+  DIR_TO_CHECK=$(/usr/bin/dirname ${TARGET_DIR})
+  while [ ! -d "${DIR_TO_CHECK}" ] && [ "${DIR_TO_CHECK}" != "/" ] && [ "${DIR_TO_CHECK}" != "." ]
+  do
+    DIR_TO_CHECK=$(/usr/bin/dirname ${DIR_TO_CHECK})
+  done
+elif [ ! -d "${TARGET_DIR}" ]
+then
+  echo "ERROR: \"${TARGET_DIR}\" is not a directory" >&2
+  exit 1
+else
+  DIR_TO_CHECK=${TARGET_DIR}
+fi
+
+# check filesystem type
+FSTYPE=$(/usr/bin/timeout $TIMEOUT /usr/bin/findmnt -n -o fstype --target "${DIR_TO_CHECK}") 
+if [ "${FSTYPE}" != "lustre" ]
+then
+  cat >&2 << EOF
+/---------/
+WARNING: imagestore directory "${TARGET_DIR}" isn't on a LUSTRE filesystem. That is suboptimal.
+
+Please move parallax imagestore to a LUSTRE filesystem.
+
+Or if you are already aware, you can disable this warning adding the following annotation in the EDF:
+
+[annotations]
+com.sarus.hooks.parallax_imagestore_create="false"
+/---------/
+EOF
+  exit 1
+else
+  FSNAME=$(/usr/bin/timeout $TIMEOUT ${LFS_CMD} getname -n "${DIR_TO_CHECK}")
+  if [ $? -ne 0 ]
+  then
+    echo "ERROR: Cannot retrieve filesystem name for \"${DIR_TO_CHECK}\", rc=$?" >&2
+    exit 1
+  fi
+
+  PFL_LAYOUT_REFERENCE="${ETC_DIR}/${FSNAME}_pfl_reference.json"
+  PFL_SETSTRIPE_OPTS_ENV="${ETC_DIR}/${FSNAME}_pfl_setstripe_opts.env"
+
+  if [ ! -f "${PFL_LAYOUT_REFERENCE}" ]
+  then
+    echo "ERROR: Missing Progressive File layout reference file \"${PFL_LAYOUT_REFERENCE}\"" >&2
+    exit 1
+  fi
+
+  if [ ! -f "${PFL_SETSTRIPE_OPTS_ENV}" ]
+  then
+    echo "ERROR: Missing Progressive File layout environment file \"${PFL_SETSTRIPE_OPTS_ENV}\"" >&2
+    exit 1
+  fi
+
+  PFL_LAYOUT_TEMPLATE="${TMP_DIR}/pfl_layout.json.XXX"
+  . ${PFL_SETSTRIPE_OPTS_ENV}
+
+  if [ -z "${LFS_SETSTRIPE_OPTS}" ]
+  then
+    echo "ERROR: Missing LFS_SETSTRIPE_OPTS environment variable " >&2
+    exit 1
+  fi
+fi
+
+# create directory
+if [ "$NEED_DIR_CREATION" == "true" ]
+then
+  mkdir -p "${TARGET_DIR}"
+  RC=$?
+  if [ "${FSTYPE}" != "lustre" ]
+  then
+    exit ${RC}
+  else
+    /usr/bin/timeout ${TIMEOUT} ${LFS_CMD} setstripe ${LFS_SETSTRIPE_OPTS} ${TARGET_DIR}
+    RC=$?
+    if [ $RC -ne 0 ]
+    then
+      echo "ERROR: \"timeout $TIMEOUT lfs setstripe\" returned: $RC" >&2
+      exit 1
+    fi
+  fi
+fi
+
+# Collect pfl.layout
+PFL_LAYOUT_OUTPUT=$(mktemp ${PFL_LAYOUT_TEMPLATE})
+/usr/bin/timeout ${TIMEOUT} /usr/bin/lfs getstripe -y -d ${TARGET_DIR} | \
+	/usr/bin/yq r - -j -P | \
+	/usr/bin/jq 'with_entries(if (.key | test("component[0-9]$")) then ({key: .key, value: del(.value.sub_layout.lmm_objects)}) else ({key: .key, value: .value}) end)' \
+	> ${PFL_LAYOUT_OUTPUT}
+RC=$?
+if [ $RC -ne 0 ]
+then
+  echo "ERROR: \"timeout $TIMEOUT lfs getstripe\" returned: $RC" >&2
+  exit 1
+fi
+
+/usr/bin/diff -q ${PFL_LAYOUT_REFERENCE} ${PFL_LAYOUT_OUTPUT} &>/dev/null
+RC=$?
+if [ $RC -ne 0 ]
+then
+  cat >&2 << EOF
+/---------/
+WARNING!!!
+imagestore directory "${TARGET_DIR}" doesn't have the expected filesystem optimization
+
+Please run:
+lustre_pfl_optimize ${TARGET_DIR}
+
+Or if you are already aware, you can disable this warning adding the following annotation in the EDF:
+
+[annotations]
+com.sarus.hooks.parallax_imagestore_create="false"
+/---------/
+EOF
+
+fi
+
+rm -f ${PFL_LAYOUT_OUTPUT}
+exit $RC
