@@ -7,16 +7,15 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    process::{self, Command},
+    process::{self},
 };
-use sysinfo::{Pid, System};
 
 #[derive(Debug, Deserialize)]
 struct OciState {
     bundle: String,
+    id: String,
     status: String,
     root: String,
-    pid: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,49 +173,6 @@ fn update_etc_passwd(root: &Path, uid: uid_t, home: &Path) -> Result<(), String>
     return Ok(());
 }
 
-fn get_uid_from_pid(pid: &u32) -> Result<uid_t, String> {
-    let s = System::new_all();
-    let process = match s.process(Pid::from_u32(*pid)) {
-        Some(p) => p,
-        None => return Err(format!("failed to find process {}", pid)),
-    };
-
-    let uid = match process.user_id() {
-        Some(u) => u,
-        None => return Err(format!("failed to find uid for process {}", pid)),
-    };
-
-    return Ok(**uid);
-}
-
-fn get_home_from_host(uid: &uid_t) -> Result<Option<PathBuf>, String> {
-
-    let getent_out = match Command::new("getent")
-                       .args(&["passwd", uid.to_string().as_str()])
-                       .output() {
-        Ok(process) => process,
-        Err(err)    => return Err(format!("Running command error: getent passwd {uid}: {err}")),
-    };
-
-    if ! getent_out.status.success() {
-        let code = getent_out.status.code().unwrap();
-        return Err(format!("Exit command error: getent passwd {uid} returned: {code}"));
-    };
-
-    let getent_stdout = match std::string::String::from_utf8(getent_out.stdout) {
-        Ok(out)  => out,
-        Err(err) => return Err(format!("Translating output command error: getent passwd {uid}: {err}")),
-    };
-
-    let getent_stdout_vec: Vec<&str> = getent_stdout.split(':').collect();
-    let homedir = match getent_stdout_vec.get(5) {
-        Some(s) => s,
-        None => return Err(format!("Output command error: getent passwd {uid}, cannot find homedir field.")),
-    };
-
-    Ok(Some(PathBuf::from(homedir)))
-}
-
 // Get home path value from Container /etc/passwd
 fn get_home_from_etc_passwd(root: &Path, uid: uid_t) -> Result<PathBuf, String> {
     let rel_path = Path::new("etc/passwd");
@@ -247,6 +203,28 @@ fn get_home_from_etc_passwd(root: &Path, uid: uid_t) -> Result<PathBuf, String> 
     ))
 }
 
+fn get_graphroot_from_root(root: &PathBuf) -> Result<PathBuf, String> {
+
+    let mut graphroot = root.clone();
+    let mut uplevels = 3;
+    while uplevels > 0 {
+        if graphroot.pop() {
+            uplevels -= 1;
+        } else {
+            return Err(format!("failed get graphroot from root: {:#?}", root));
+        }
+    }
+    Ok(graphroot)
+}
+
+fn get_bundle_from_graphroot_and_id(graphroot: &PathBuf, id: &String) -> String {
+    let rel_path_str = format!("overlay-containers/{id}/userdata");
+    let rel_path = Path::new(&rel_path_str);
+    let bundle = graphroot.join(rel_path);
+    let bundle_string = bundle.to_string_lossy().to_string();
+    bundle_string
+}
+
 fn run() -> Result<i32, String> {
     let oci_state: OciState =
         read_stdin_json().map_err(|e| format!("failed to parse OCI State: {e}"))?;
@@ -255,17 +233,16 @@ fn run() -> Result<i32, String> {
         return Ok(0);
     }
 
-    let config = match get_config_from_bundle(Path::new(&oci_state.bundle)) {
-        Ok(cfg) => cfg,
-        Err(_) => {
-            let uid = get_uid_from_pid(&oci_state.pid)?;
-            let home = get_home_from_host(&uid)?;
-            ConfigData {
-                uid: uid,
-                home: home,
-            }
-        },
-    };
+    let bundle;
+    if oci_state.bundle != "/" {
+        bundle = oci_state.bundle;
+    } else {
+        let root_path = PathBuf::from(&oci_state.root);
+        let graphroot = get_graphroot_from_root(&root_path)?;
+        bundle = get_bundle_from_graphroot_and_id(&graphroot, &oci_state.id);
+    }
+
+    let config = get_config_from_bundle(Path::new(&bundle))?;
 
     let home = match config.home {
         Some(h) => {
