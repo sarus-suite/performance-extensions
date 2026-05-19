@@ -47,7 +47,7 @@ if [ "${FSTYPE}" != "lustre" ]
 then
   cat >&2 << EOF
 /---------/
-WARNING: imagestore directory \"${TARGET_DIR}\" isn't on a LUSTRE filesystem. That is suboptimal.
+WARNING: imagestore directory "${TARGET_DIR}" isn't on a LUSTRE filesystem. That is suboptimal.
 
 Please move parallax imagestore to a LUSTRE filesystem.
 
@@ -130,7 +130,7 @@ then
   cat >&2 << EOF
 /---------/
 WARNING!!!
-imagestore directory \"${TARGET_DIR}\" doesn't have the expected filesystem optimization
+imagestore directory "${TARGET_DIR}" doesn't have the expected filesystem optimization
 
 Please run:
 lustre_pfl_optimize ${TARGET_DIR}
