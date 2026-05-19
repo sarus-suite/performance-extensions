@@ -13,6 +13,7 @@ use std::{
 #[derive(Debug, Deserialize)]
 struct OciState {
     bundle: String,
+    id: String,
     status: String,
     root: String,
 }
@@ -202,6 +203,28 @@ fn get_home_from_etc_passwd(root: &Path, uid: uid_t) -> Result<PathBuf, String> 
     ))
 }
 
+fn get_graphroot_from_root(root: &PathBuf) -> Result<PathBuf, String> {
+
+    let mut graphroot = root.clone();
+    let mut uplevels = 3;
+    while uplevels > 0 {
+        if graphroot.pop() {
+            uplevels -= 1;
+        } else {
+            return Err(format!("failed get graphroot from root: {:#?}", root));
+        }
+    }
+    Ok(graphroot)
+}
+
+fn get_bundle_from_graphroot_and_id(graphroot: &PathBuf, id: &String) -> String {
+    let rel_path_str = format!("overlay-containers/{id}/userdata");
+    let rel_path = Path::new(&rel_path_str);
+    let bundle = graphroot.join(rel_path);
+    let bundle_string = bundle.to_string_lossy().to_string();
+    bundle_string
+}
+
 fn run() -> Result<i32, String> {
     let oci_state: OciState =
         read_stdin_json().map_err(|e| format!("failed to parse OCI State: {e}"))?;
@@ -210,7 +233,16 @@ fn run() -> Result<i32, String> {
         return Ok(0);
     }
 
-    let config = get_config_from_bundle(Path::new(&oci_state.bundle))?;
+    let bundle;
+    if oci_state.bundle != "/" {
+        bundle = oci_state.bundle;
+    } else {
+        let root_path = PathBuf::from(&oci_state.root);
+        let graphroot = get_graphroot_from_root(&root_path)?;
+        bundle = get_bundle_from_graphroot_and_id(&graphroot, &oci_state.id);
+    }
+
+    let config = get_config_from_bundle(Path::new(&bundle))?;
 
     let home = match config.home {
         Some(h) => {
