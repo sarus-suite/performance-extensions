@@ -27,13 +27,13 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           # for manual trigger
           ref: ${{ inputs.ref != '' && inputs.ref || github.ref_name }}
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -56,13 +56,17 @@ jobs:
             bash -lc '
               cargo build --release
               mkdir -p dist/hooks-${{ matrix.arch }}
-              cp target/release/ldcache_hook "dist/hooks-${{ matrix.arch }}/ldcache_hook-${{ github.ref_name }}"
-              cp target/release/pce_hook "dist/hooks-${{ matrix.arch }}/pce_hook-${{ github.ref_name }}"
-              cp target/release/mps_hook "dist/hooks-${{ matrix.arch }}/mps_hook-${{ github.ref_name }}"
-              cp target/release/sethomevar "dist/hooks-${{ matrix.arch }}/sethomevar-${{ github.ref_name }}"
-              cp target/release/mkhomedir "dist/hooks-${{ matrix.arch }}/mkhomedir-${{ github.ref_name }}"
+              cp target/release/ldcache_hook "dist/hooks-${{ matrix.arch }}/ldcache_hook"
+              cp target/release/pce_hook "dist/hooks-${{ matrix.arch }}/pce_hook"
+              cp target/release/mps_hook "dist/hooks-${{ matrix.arch }}/mps_hook"
+              cp target/release/sethomevar "dist/hooks-${{ matrix.arch }}/sethomevar"
+              cp target/release/mkhomedir "dist/hooks-${{ matrix.arch }}/mkhomedir"
               tar -C dist/hooks-${{ matrix.arch }} -czf "dist/hooks-${{ matrix.arch }}.tar.gz" .
               ls -lah target/release/
+              mkdir -p dist/scripts
+              cp -a scripts/lustre_pfl/bin dist/scripts/
+              cp -a scripts/lustre_pfl/sbin dist/scripts/
+              tar -C dist/scripts -czf "dist/scripts.tar.gz" .
               ls -lah dist/
             '
 
@@ -71,5 +75,14 @@ jobs:
         with:
           name: hooks-${{ matrix.arch }}
           path: dist/hooks-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+          archive: false
+      
+      - name: Upload scripts archive
+        if: ${{ matrix.arch == 'amd64' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: scripts
+          path: dist/scripts.tar.gz
           if-no-files-found: error
           archive: false
