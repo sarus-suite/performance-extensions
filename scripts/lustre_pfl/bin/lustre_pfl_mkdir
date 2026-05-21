@@ -11,17 +11,17 @@ TIMEOUT="10"
 TMP_DIR="/tmp"
 
 # Check dependencies
-[ ! -x /usr/bin/timeout ] && echo "ERROR: missing /usr/bin/timeout" >&2 && exit 1
-[ ! -x /usr/bin/dirname ] && echo "ERROR: missing /usr/bin/dirname" >&2 && exit 1
-[ ! -x /usr/bin/findmnt ] && echo "ERROR: missing /usr/bin/findmnt" >&2 && exit 1
-[ ! -x ${LFS_CMD}       ] && echo "ERROR: missing ${LFS_CMD}"       >&2 && exit 1
-[ ! -x /usr/bin/yq      ] && echo "ERROR: missing /usr/bin/yq"      >&2 && exit 1
-[ ! -x /usr/bin/jq      ] && echo "ERROR: missing /usr/bin/jq"      >&2 && exit 1
-[ ! -x /usr/bin/diff    ] && echo "ERROR: missing /usr/bin/diff"    >&2 && exit 1
+[ ! -x /usr/bin/timeout ] && echo "ERROR: missing /usr/bin/timeout" >&1 && exit 1
+[ ! -x /usr/bin/dirname ] && echo "ERROR: missing /usr/bin/dirname" >&1 && exit 1
+[ ! -x /usr/bin/findmnt ] && echo "ERROR: missing /usr/bin/findmnt" >&1 && exit 1
+[ ! -x ${LFS_CMD}       ] && echo "ERROR: missing ${LFS_CMD}"       >&1 && exit 1
+[ ! -x /usr/bin/yq      ] && echo "ERROR: missing /usr/bin/yq"      >&1 && exit 1
+[ ! -x /usr/bin/jq      ] && echo "ERROR: missing /usr/bin/jq"      >&1 && exit 1
+[ ! -x /usr/bin/diff    ] && echo "ERROR: missing /usr/bin/diff"    >&1 && exit 1
 
 if [ -z "${TARGET_DIR}" ]
 then
-  echo "ERROR: you must specify a target directory path" >&2
+  echo "ERROR: you must specify a target directory path" >&1
   exit 1
 fi
 
@@ -35,7 +35,7 @@ then
   done
 elif [ ! -d "${TARGET_DIR}" ]
 then
-  echo "ERROR: \"${TARGET_DIR}\" is not a directory" >&2
+  echo "ERROR: \"${TARGET_DIR}\" is not a directory" >&1
   exit 1
 else
   DIR_TO_CHECK=${TARGET_DIR}
@@ -45,7 +45,7 @@ fi
 FSTYPE=$(/usr/bin/timeout $TIMEOUT /usr/bin/findmnt -n -o fstype --target "${DIR_TO_CHECK}") 
 if [ "${FSTYPE}" != "lustre" ]
 then
-  cat >&2 << EOF
+  cat >&1 << EOF
 /---------/
 WARNING: imagestore directory "${TARGET_DIR}" isn't on a LUSTRE filesystem. That is suboptimal.
 
@@ -62,7 +62,7 @@ else
   FSNAME=$(/usr/bin/timeout $TIMEOUT ${LFS_CMD} getname -n "${DIR_TO_CHECK}")
   if [ $? -ne 0 ]
   then
-    echo "ERROR: Cannot retrieve filesystem name for \"${DIR_TO_CHECK}\", rc=$?" >&2
+    echo "ERROR: Cannot retrieve filesystem name for \"${DIR_TO_CHECK}\", rc=$?" >&1
     exit 1
   fi
 
@@ -71,13 +71,13 @@ else
 
   if [ ! -f "${PFL_LAYOUT_REFERENCE}" ]
   then
-    echo "ERROR: Missing Progressive File layout reference file \"${PFL_LAYOUT_REFERENCE}\"" >&2
+    echo "ERROR: Missing Progressive File layout reference file \"${PFL_LAYOUT_REFERENCE}\"" >&1
     exit 1
   fi
 
   if [ ! -f "${PFL_SETSTRIPE_OPTS_ENV}" ]
   then
-    echo "ERROR: Missing Progressive File layout environment file \"${PFL_SETSTRIPE_OPTS_ENV}\"" >&2
+    echo "ERROR: Missing Progressive File layout environment file \"${PFL_SETSTRIPE_OPTS_ENV}\"" >&1
     exit 1
   fi
 
@@ -86,7 +86,7 @@ else
 
   if [ -z "${LFS_SETSTRIPE_OPTS}" ]
   then
-    echo "ERROR: Missing LFS_SETSTRIPE_OPTS environment variable " >&2
+    echo "ERROR: Missing LFS_SETSTRIPE_OPTS environment variable " >&1
     exit 1
   fi
 fi
@@ -104,7 +104,7 @@ then
     RC=$?
     if [ $RC -ne 0 ]
     then
-      echo "ERROR: \"timeout $TIMEOUT lfs setstripe\" returned: $RC" >&2
+      echo "ERROR: \"timeout $TIMEOUT lfs setstripe\" returned: $RC" >&1
       exit 1
     fi
   fi
@@ -119,7 +119,7 @@ PFL_LAYOUT_OUTPUT=$(mktemp ${PFL_LAYOUT_TEMPLATE})
 RC=$?
 if [ $RC -ne 0 ]
 then
-  echo "ERROR: \"timeout $TIMEOUT lfs getstripe\" returned: $RC" >&2
+  echo "ERROR: \"timeout $TIMEOUT lfs getstripe\" returned: $RC" >&1
   exit 1
 fi
 
@@ -127,7 +127,7 @@ fi
 RC=$?
 if [ $RC -ne 0 ]
 then
-  cat >&2 << EOF
+  cat >&1 << EOF
 /---------/
 WARNING!!!
 imagestore directory "${TARGET_DIR}" doesn't have the expected filesystem optimization
