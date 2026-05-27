@@ -1,0 +1,95 @@
+name: artifact release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-and-release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prebuild devcontainer
+        uses: devcontainers/ci@v0.3
+        with:
+          imageName: ghcr.io/${{ github.repository }}/devcontainer-${{ matrix.arch }}
+          cacheFrom: ghcr.io/${{ github.repository }}/devcontainer-${{ matrix.arch }}
+          push: always
+
+      - name: Build and package artifacts
+        uses: devcontainers/ci@v0.3
+        with:
+          imageName: ghcr.io/${{ github.repository }}/devcontainer-${{ matrix.arch }}
+          cacheFrom: ghcr.io/${{ github.repository }}/devcontainer-${{ matrix.arch }}
+          push: never
+          runCmd: |
+            bash -euxo pipefail <<'EOF'
+            cargo build --release
+
+            mkdir -p dist/hooks-${{ matrix.arch }}
+
+            cp target/release/ldcache_hook       "dist/hooks-${{ matrix.arch }}/ldcache_hook"
+            cp target/release/pce_hook           "dist/hooks-${{ matrix.arch }}/pce_hook"
+            cp target/release/mps_hook           "dist/hooks-${{ matrix.arch }}/mps_hook"
+            cp target/release/sethomevar         "dist/hooks-${{ matrix.arch }}/sethomevar"
+            cp target/release/mkhomedir          "dist/hooks-${{ matrix.arch }}/mkhomedir"
+            cp target/release/pc_injection_hook  "dist/hooks-${{ matrix.arch }}/pc_injection_hook"
+
+            tar -C dist/hooks-${{ matrix.arch }} \
+              -czf "dist/hooks-${{ matrix.arch }}.tar.gz" .
+
+            sha256sum "dist/hooks-${{ matrix.arch }}.tar.gz" \
+              > "dist/hooks-${{ matrix.arch }}.tar.gz.sha256"
+
+            if [ "${{ matrix.arch }}" = "amd64" ]; then
+              mkdir -p dist/scripts
+              cp -a scripts/lustre_pfl/bin dist/scripts/
+              cp -a scripts/lustre_pfl/sbin dist/scripts/
+              tar -C dist/scripts -czf "dist/scripts.tar.gz" .
+              sha256sum "dist/scripts.tar.gz" > "dist/scripts.tar.gz.sha256"
+            fi
+
+            ls -lah dist/
+            EOF
+
+      - name: Publish hook archive to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            dist/hooks-${{ matrix.arch }}.tar.gz
+            dist/hooks-${{ matrix.arch }}.tar.gz.sha256
+
+      - name: Publish scripts archive to GitHub Release
+        if: ${{ matrix.arch == 'amd64' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            dist/scripts.tar.gz
+            dist/scripts.tar.gz.sha256
+
