@@ -4,6 +4,8 @@ members = [
     "crates/mps_hook",
     "crates/ldcache_hook",
     "crates/pc_injection_hook",
+    "crates/mkhomedir",
+    "crates/sethomevar",
 ]
 resolver = "2"
 
