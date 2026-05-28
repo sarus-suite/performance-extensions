@@ -1189,6 +1189,28 @@ fn append_extra_mounts(
     let mounts = ensure_array_field(obj, "mounts")?;
 
     for mount in mounts_to_add {
+        let mut already_present = false;
+
+        for existing in mounts.iter() {
+            match oci_mount_matches_extra_mount(existing, mount)? {
+                Some(true) => {
+                    already_present = true;
+                    break;
+                }
+                Some(false) => {
+                    return Err(Error::message(format!(
+                        "conflicting planned extra mounts for {}",
+                        mount.destination.display()
+                    )))
+                }
+                None => {}
+            }
+        }
+
+        if already_present {
+            continue;
+        }
+
         let mut out = Map::new();
         out.insert(
             "destination".to_string(),
@@ -1207,6 +1229,58 @@ fn append_extra_mounts(
     }
 
     Ok(())
+}
+
+fn oci_mount_matches_extra_mount(existing: &Value, mount: &ExtraMountEdit) -> Result<Option<bool>> {
+    let Some(obj) = existing.as_object() else {
+        return Ok(None);
+    };
+
+    let Some(destination) = obj.get("destination").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+
+    if destination != mount.destination.to_string_lossy() {
+        return Ok(None);
+    }
+
+    let source = obj.get("source").and_then(Value::as_str).ok_or_else(|| {
+        Error::message(format!(
+            "existing mount for {} is missing string source",
+            mount.destination.display()
+        ))
+    })?;
+    let mount_type = obj.get("type").and_then(Value::as_str).ok_or_else(|| {
+        Error::message(format!(
+            "existing mount for {} is missing string type",
+            mount.destination.display()
+        ))
+    })?;
+    let options = obj
+        .get("options")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            Error::message(format!(
+                "existing mount for {} is missing array options",
+                mount.destination.display()
+            ))
+        })?
+        .iter()
+        .map(|value| {
+            value.as_str().map(ToString::to_string).ok_or_else(|| {
+                Error::message(format!(
+                    "existing mount for {} has non-string option",
+                    mount.destination.display()
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(Some(
+        source == mount.source.to_string_lossy()
+            && mount_type == mount.mount_type
+            && options == mount.options,
+    ))
 }
 
 fn merge_ld_library_path(obj: &mut Map<String, Value>, dirs: &[PathBuf]) -> Result<()> {
@@ -1641,6 +1715,77 @@ mod tests {
             mounts[1]["options"],
             serde_json::json!(["bind", "rw", "nosuid", "nodev"])
         );
+    }
+
+    #[test]
+    fn apply_config_edits_skips_identical_existing_extra_mount() {
+        let mut config = serde_json::json!({
+            "root": { "path": "/rootfs" },
+            "mounts": [{
+                "destination": "/var/spool/slurmd",
+                "type": "bind",
+                "source": "/host/slurmd",
+                "options": ["bind", "rw", "nosuid", "nodev"]
+            }]
+        });
+        let edits = ConfigEdits {
+            mounts: Vec::new(),
+            ld_library_path_dirs: Vec::new(),
+            extra_mounts: vec![ExtraMountEdit {
+                source: PathBuf::from("/host/slurmd"),
+                destination: PathBuf::from("/var/spool/slurmd"),
+                mount_type: "bind".to_string(),
+                options: vec![
+                    "bind".to_string(),
+                    "rw".to_string(),
+                    "nosuid".to_string(),
+                    "nodev".to_string(),
+                ],
+            }],
+            extra_env: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        apply_config_edits(&mut config, &edits).unwrap();
+
+        let mounts = config["mounts"].as_array().unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0]["destination"], "/var/spool/slurmd");
+    }
+
+    #[test]
+    fn apply_config_edits_rejects_conflicting_existing_extra_mount() {
+        let mut config = serde_json::json!({
+            "root": { "path": "/rootfs" },
+            "mounts": [{
+                "destination": "/var/spool/slurmd",
+                "type": "bind",
+                "source": "/host/other-slurmd",
+                "options": ["bind", "rw", "nosuid", "nodev"]
+            }]
+        });
+        let edits = ConfigEdits {
+            mounts: Vec::new(),
+            ld_library_path_dirs: Vec::new(),
+            extra_mounts: vec![ExtraMountEdit {
+                source: PathBuf::from("/host/slurmd"),
+                destination: PathBuf::from("/var/spool/slurmd"),
+                mount_type: "bind".to_string(),
+                options: vec![
+                    "bind".to_string(),
+                    "rw".to_string(),
+                    "nosuid".to_string(),
+                    "nodev".to_string(),
+                ],
+            }],
+            extra_env: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        let error = apply_config_edits(&mut config, &edits).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("conflicting planned extra mounts for /var/spool/slurmd"));
     }
 
     #[test]
