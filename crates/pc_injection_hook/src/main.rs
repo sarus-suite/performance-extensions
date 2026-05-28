@@ -304,7 +304,10 @@ fn parse_mount_spec_entry(var: &'static str, entry: &str) -> Result<ExtraMountEd
         )));
     }
 
-    let source = PathBuf::from(parts[0].trim());
+    let source = canonical_mount_source_path(
+        &PathBuf::from(parts[0].trim()),
+        "extra mount source",
+    )?;
     let destination = PathBuf::from(parts[1].trim());
     let mount_type = parts[2].trim();
     let options = if parts[3].trim().is_empty() {
@@ -317,8 +320,6 @@ fn parse_mount_spec_entry(var: &'static str, entry: &str) -> Result<ExtraMountEd
             .map(ToString::to_string)
             .collect::<Vec<_>>()
     };
-
-    validate_mount_source_path(&source, "extra mount source")?;
     validate_mount_destination(&destination)?;
     validate_mount_options(&options)?;
 
@@ -940,7 +941,7 @@ fn validate_regular_source_file(source: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_mount_source_path(source: &Path, label: &str) -> Result<()> {
+fn canonical_mount_source_path(source: &Path, label: &str) -> Result<PathBuf> {
     if !source.is_absolute() {
         return Err(Error::message(format!(
             "{label} must be absolute: {}",
@@ -948,18 +949,23 @@ fn validate_mount_source_path(source: &Path, label: &str) -> Result<()> {
         )));
     }
 
-    let source_metadata = fs::symlink_metadata(source)
-        .map_err(|e| Error::io(format!("failed to stat {label} {}", source.display()), e))?;
-    let file_type = source_metadata.file_type();
+    let canonical = fs::canonicalize(source).map_err(|e| {
+        Error::io(
+            format!("failed to canonicalize {label} {}", source.display()),
+            e,
+        )
+    })?;
+    let source_metadata = fs::metadata(&canonical)
+        .map_err(|e| Error::io(format!("failed to stat {label} {}", canonical.display()), e))?;
 
-    if !(file_type.is_file() || file_type.is_dir()) {
+    if !(source_metadata.is_file() || source_metadata.is_dir()) {
         return Err(Error::message(format!(
-            "{label} must be a regular file or directory: {}",
-            source.display()
+            "{label} must resolve to a regular file or directory: {}",
+            canonical.display()
         )));
     }
 
-    Ok(())
+    Ok(canonical)
 }
 
 // INJECTION_EXTRA_FILES are raw file mounts and we need those to be exact
@@ -1183,6 +1189,28 @@ fn append_extra_mounts(
     let mounts = ensure_array_field(obj, "mounts")?;
 
     for mount in mounts_to_add {
+        let mut already_present = false;
+
+        for existing in mounts.iter() {
+            match oci_mount_matches_extra_mount(existing, mount)? {
+                Some(true) => {
+                    already_present = true;
+                    break;
+                }
+                Some(false) => {
+                    return Err(Error::message(format!(
+                        "conflicting planned extra mounts for {}",
+                        mount.destination.display()
+                    )))
+                }
+                None => {}
+            }
+        }
+
+        if already_present {
+            continue;
+        }
+
         let mut out = Map::new();
         out.insert(
             "destination".to_string(),
@@ -1201,6 +1229,58 @@ fn append_extra_mounts(
     }
 
     Ok(())
+}
+
+fn oci_mount_matches_extra_mount(existing: &Value, mount: &ExtraMountEdit) -> Result<Option<bool>> {
+    let Some(obj) = existing.as_object() else {
+        return Ok(None);
+    };
+
+    let Some(destination) = obj.get("destination").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+
+    if destination != mount.destination.to_string_lossy() {
+        return Ok(None);
+    }
+
+    let source = obj.get("source").and_then(Value::as_str).ok_or_else(|| {
+        Error::message(format!(
+            "existing mount for {} is missing string source",
+            mount.destination.display()
+        ))
+    })?;
+    let mount_type = obj.get("type").and_then(Value::as_str).ok_or_else(|| {
+        Error::message(format!(
+            "existing mount for {} is missing string type",
+            mount.destination.display()
+        ))
+    })?;
+    let options = obj
+        .get("options")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            Error::message(format!(
+                "existing mount for {} is missing array options",
+                mount.destination.display()
+            ))
+        })?
+        .iter()
+        .map(|value| {
+            value.as_str().map(ToString::to_string).ok_or_else(|| {
+                Error::message(format!(
+                    "existing mount for {} has non-string option",
+                    mount.destination.display()
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(Some(
+        source == mount.source.to_string_lossy()
+            && mount_type == mount.mount_type
+            && options == mount.options,
+    ))
 }
 
 fn merge_ld_library_path(obj: &mut Map<String, Value>, dirs: &[PathBuf]) -> Result<()> {
@@ -1638,6 +1718,77 @@ mod tests {
     }
 
     #[test]
+    fn apply_config_edits_skips_identical_existing_extra_mount() {
+        let mut config = serde_json::json!({
+            "root": { "path": "/rootfs" },
+            "mounts": [{
+                "destination": "/var/spool/slurmd",
+                "type": "bind",
+                "source": "/host/slurmd",
+                "options": ["bind", "rw", "nosuid", "nodev"]
+            }]
+        });
+        let edits = ConfigEdits {
+            mounts: Vec::new(),
+            ld_library_path_dirs: Vec::new(),
+            extra_mounts: vec![ExtraMountEdit {
+                source: PathBuf::from("/host/slurmd"),
+                destination: PathBuf::from("/var/spool/slurmd"),
+                mount_type: "bind".to_string(),
+                options: vec![
+                    "bind".to_string(),
+                    "rw".to_string(),
+                    "nosuid".to_string(),
+                    "nodev".to_string(),
+                ],
+            }],
+            extra_env: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        apply_config_edits(&mut config, &edits).unwrap();
+
+        let mounts = config["mounts"].as_array().unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0]["destination"], "/var/spool/slurmd");
+    }
+
+    #[test]
+    fn apply_config_edits_rejects_conflicting_existing_extra_mount() {
+        let mut config = serde_json::json!({
+            "root": { "path": "/rootfs" },
+            "mounts": [{
+                "destination": "/var/spool/slurmd",
+                "type": "bind",
+                "source": "/host/other-slurmd",
+                "options": ["bind", "rw", "nosuid", "nodev"]
+            }]
+        });
+        let edits = ConfigEdits {
+            mounts: Vec::new(),
+            ld_library_path_dirs: Vec::new(),
+            extra_mounts: vec![ExtraMountEdit {
+                source: PathBuf::from("/host/slurmd"),
+                destination: PathBuf::from("/var/spool/slurmd"),
+                mount_type: "bind".to_string(),
+                options: vec![
+                    "bind".to_string(),
+                    "rw".to_string(),
+                    "nosuid".to_string(),
+                    "nodev".to_string(),
+                ],
+            }],
+            extra_env: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        let error = apply_config_edits(&mut config, &edits).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("conflicting planned extra mounts for /var/spool/slurmd"));
+    }
+
+    #[test]
     fn discovery_warns_for_unparseable_container_library() {
         let temp_root = unique_temp_path("requested-parse");
         let rootfs = temp_root.join("rootfs");
@@ -1751,6 +1902,46 @@ mod tests {
             mounts,
             vec![ExtraMountEdit {
                 source: mount_source.clone(),
+                destination: PathBuf::from("/var/spool/slurmd"),
+                mount_type: "bind".to_string(),
+                options: vec![
+                    "bind".to_string(),
+                    "rw".to_string(),
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "nodev".to_string(),
+                    "private".to_string(),
+                ],
+            }]
+        );
+
+        std::env::remove_var("INJECTION_EXTRA_MOUNTS");
+        fs::remove_dir_all(&temp_root).unwrap();
+    }
+
+    #[test]
+    fn parse_optional_mount_specs_canonicalizes_symlink_sources() {
+        let temp_root = unique_temp_path("extra-mount-symlink");
+        let real_source = temp_root.join("real/slurmd");
+        let symlink_source = temp_root.join("link/slurmd");
+
+        fs::create_dir_all(&real_source).unwrap();
+        fs::create_dir_all(symlink_source.parent().unwrap()).unwrap();
+        symlink(&real_source, &symlink_source).unwrap();
+
+        std::env::set_var(
+            "INJECTION_EXTRA_MOUNTS",
+            format!(
+                "{}:/var/spool/slurmd:bind:bind,rw,nosuid,noexec,nodev,private",
+                symlink_source.display()
+            ),
+        );
+
+        let mounts = parse_optional_mount_specs("INJECTION_EXTRA_MOUNTS").unwrap();
+        assert_eq!(
+            mounts,
+            vec![ExtraMountEdit {
+                source: fs::canonicalize(&real_source).unwrap(),
                 destination: PathBuf::from("/var/spool/slurmd"),
                 mount_type: "bind".to_string(),
                 options: vec![
