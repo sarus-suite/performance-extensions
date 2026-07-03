@@ -93,14 +93,16 @@ struct HookInputs {
     extra_files: Vec<PathBuf>,
     extra_mounts: Vec<ExtraMountEdit>,
     extra_env: Vec<String>,
-    _compatibility_policy: CompatibilityPolicy,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CompatibilityPolicy {
-    Major,
-    Full,
-    Strict,
+#[derive(Debug, Default)]
+struct CliOverrides {
+    ldconfig: Option<PathBuf>,
+    primary_libs: Vec<Library>,
+    dependency_libs: Vec<Library>,
+    extra_files: Vec<PathBuf>,
+    extra_mounts: Vec<ExtraMountEdit>,
+    extra_env: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -186,6 +188,10 @@ fn write_stdout_json(value: &Value) -> Result<()> {
 }
 
 fn load_inputs(config: &Value) -> Result<HookInputs> {
+    load_inputs_from_sources(config, parse_cli_overrides()?)
+}
+
+fn load_inputs_from_sources(config: &Value, cli: CliOverrides) -> Result<HookInputs> {
     let root_path = config
         .get("root")
         .and_then(Value::as_object)
@@ -193,20 +199,66 @@ fn load_inputs(config: &Value) -> Result<HookInputs> {
         .and_then(Value::as_str)
         .ok_or_else(|| Error::message("OCI config is missing root.path"))?;
 
+    let env_ldconfig =
+        PathBuf::from(env::var_os("LDCONFIG_PATH").unwrap_or_else(|| "ldconfig".into()));
+    let env_primary_libs = parse_optional_library_list("INJECTION_PRIMARY_LIBS")?;
+    let env_dependency_libs = parse_optional_library_list("INJECTION_DEPENDENCY_LIBS")?;
+    let env_extra_files = parse_optional_path_list("INJECTION_EXTRA_FILES");
+    let env_extra_mounts = parse_optional_mount_specs("INJECTION_EXTRA_MOUNTS")?;
+    let env_extra_env = parse_optional_env_specs("INJECTION_EXTRA_ENV")?;
+
     let inputs = HookInputs {
         rootfs: resolve_rootfs(root_path)?,
-        ldconfig: PathBuf::from(env::var_os("LDCONFIG_PATH").unwrap_or_else(|| "ldconfig".into())),
-        primary_libs: parse_optional_library_list("INJECTION_PRIMARY_LIBS")?,
-        dependency_libs: parse_optional_library_list("INJECTION_DEPENDENCY_LIBS")?,
-        extra_files: parse_optional_path_list("INJECTION_EXTRA_FILES"),
-        extra_mounts: parse_optional_mount_specs("INJECTION_EXTRA_MOUNTS")?,
-        extra_env: parse_optional_env_specs("INJECTION_EXTRA_ENV")?,
-        _compatibility_policy: CompatibilityPolicy::from_env("INJECTION_COMPATIBILITY")?,
+        ldconfig: cli.ldconfig.unwrap_or(env_ldconfig),
+        primary_libs: prefer_cli_vec(cli.primary_libs, env_primary_libs),
+        dependency_libs: prefer_cli_vec(cli.dependency_libs, env_dependency_libs),
+        extra_files: prefer_cli_vec(cli.extra_files, env_extra_files),
+        extra_mounts: prefer_cli_vec(cli.extra_mounts, env_extra_mounts),
+        extra_env: prefer_cli_vec(cli.extra_env, env_extra_env),
     };
 
     validate_inputs(&inputs)?;
 
     Ok(inputs)
+}
+
+fn parse_cli_overrides() -> Result<CliOverrides> {
+    parse_cli_overrides_from_args(env::args_os().skip(1))
+}
+
+fn parse_cli_overrides_from_args<I>(args: I) -> Result<CliOverrides>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    let mut overrides = CliOverrides::default();
+
+    for arg in args {
+        let arg = arg
+            .into_string()
+            .map_err(|_| Error::message("hook args must contain valid UTF-8"))?;
+
+        if let Some(value) = arg.strip_prefix("--ldconfig=") {
+            overrides.ldconfig = Some(PathBuf::from(value));
+        } else if let Some(value) = arg.strip_prefix("--lib=") {
+            overrides.primary_libs.push(Library::parse_host(value)?);
+        } else if let Some(value) = arg.strip_prefix("--dependency-lib=") {
+            overrides
+                .dependency_libs
+                .push(Library::parse_host(value)?);
+        } else if let Some(value) = arg.strip_prefix("--file=") {
+            overrides.extra_files.push(PathBuf::from(value));
+        } else if let Some(value) = arg.strip_prefix("--env=") {
+            let value = value.trim().to_string();
+            validate_kv_format(&value)?;
+            overrides.extra_env.push(value);
+        } else if let Some(value) = arg.strip_prefix("--mount=") {
+            overrides.extra_mounts.push(parse_cli_mount_spec(value)?);
+        } else {
+            return Err(Error::message(format!("unsupported argument: {arg}")));
+        }
+    }
+
+    Ok(overrides)
 }
 
 fn resolve_rootfs(root_path: &str) -> Result<PathBuf> {
@@ -232,11 +284,15 @@ fn parse_optional_library_list(var: &'static str) -> Result<Vec<Library>> {
 fn validate_inputs(inputs: &HookInputs) -> Result<()> {
     if inputs.primary_libs.is_empty() && inputs.dependency_libs.is_empty() {
         return Err(Error::message(
-            "at least one of INJECTION_PRIMARY_LIBS or INJECTION_DEPENDENCY_LIBS must be non-empty",
+            "at least one primary library (--lib or INJECTION_PRIMARY_LIBS) or dependency library (--dependency-lib or INJECTION_DEPENDENCY_LIBS) must be provided",
         ));
     }
 
     Ok(())
+}
+
+fn prefer_cli_vec<T>(cli: Vec<T>, env: Vec<T>) -> Vec<T> {
+    if cli.is_empty() { env } else { cli }
 }
 
 fn parse_optional_path_list(var: &'static str) -> Vec<PathBuf> {
@@ -294,6 +350,40 @@ fn parse_optional_mount_specs(var: &'static str) -> Result<Vec<ExtraMountEdit>> 
         .filter(|entry| !entry.trim().is_empty())
         .map(|entry| parse_mount_spec_entry(var, entry.trim()))
         .collect()
+}
+
+fn parse_cli_mount_spec(entry: &str) -> Result<ExtraMountEdit> {
+    let parts = entry.splitn(3, ':').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Err(Error::message(format!(
+            "--mount entries must use source:destination:options format: {entry}"
+        )));
+    }
+
+    let source = canonical_mount_source_path(
+        &PathBuf::from(parts[0].trim()),
+        "extra mount source",
+    )?;
+    let destination = PathBuf::from(parts[1].trim());
+    let options = if parts[2].trim().is_empty() {
+        Vec::new()
+    } else {
+        parts[2]
+            .split(',')
+            .map(str::trim)
+            .filter(|option| !option.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    };
+    validate_mount_destination(&destination)?;
+    validate_mount_options(&options)?;
+
+    Ok(ExtraMountEdit {
+        source,
+        destination,
+        mount_type: "bind".to_string(),
+        options: strip_non_oci_mount_options(options),
+    })
 }
 
 fn parse_mount_spec_entry(var: &'static str, entry: &str) -> Result<ExtraMountEdit> {
@@ -362,26 +452,6 @@ fn validate_mount_options(options: &[String]) -> Result<()> {
     }
 
     Ok(())
-}
-
-impl CompatibilityPolicy {
-    fn from_env(var: &'static str) -> Result<Self> {
-        match env::var(var) {
-            Ok(value) => Self::parse(&value),
-            Err(_) => Ok(Self::Major),
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "major" => Ok(Self::Major),
-            "full" => Ok(Self::Full),
-            "strict" => Ok(Self::Strict),
-            other => Err(Error::message(format!(
-                "unsupported compatibility policy '{other}'"
-            ))),
-        }
-    }
 }
 
 impl Library {
@@ -1442,7 +1512,6 @@ mod tests {
             extra_files: Vec::new(),
             extra_mounts: Vec::new(),
             extra_env: Vec::new(),
-            _compatibility_policy: CompatibilityPolicy::Full,
         };
         let container_libs = vec![Library::parse_host("/usr/lib/libmpi.so.13.4").unwrap()];
 
@@ -1498,7 +1567,6 @@ mod tests {
             extra_files: Vec::new(),
             extra_mounts: Vec::new(),
             extra_env: Vec::new(),
-            _compatibility_policy: CompatibilityPolicy::Major,
         };
         let container_libs = vec![
             Library::parse_host("/usr/lib64/libmpi.so.12.3").unwrap(),
@@ -1550,7 +1618,6 @@ mod tests {
             extra_files: Vec::new(),
             extra_mounts: Vec::new(),
             extra_env: Vec::new(),
-            _compatibility_policy: CompatibilityPolicy::Major,
         };
         let container_libs = vec![
             Library::parse_host("/usr/lib64/libmpi.so.12.3").unwrap(),
@@ -1598,7 +1665,6 @@ mod tests {
             extra_files: Vec::new(),
             extra_mounts: Vec::new(),
             extra_env: Vec::new(),
-            _compatibility_policy: CompatibilityPolicy::Full,
         };
         let container_libs = vec![
             Library::parse_host("/usr/lib64/libmpi.so.12.3").unwrap(),
@@ -1813,7 +1879,6 @@ mod tests {
             extra_files: Vec::new(),
             extra_mounts: Vec::new(),
             extra_env: Vec::new(),
-            _compatibility_policy: CompatibilityPolicy::Major,
         };
 
         let discovery = discover_container_libraries(&inputs).unwrap();
@@ -1846,7 +1911,6 @@ mod tests {
             extra_files: vec![extra.clone()],
             extra_mounts: Vec::new(),
             extra_env: Vec::new(),
-            _compatibility_policy: CompatibilityPolicy::Major,
         };
         let container_libs = vec![Library::parse_host("/usr/lib/libmpi.so.12.1").unwrap()];
 
@@ -1960,6 +2024,183 @@ mod tests {
     }
 
     #[test]
+    fn parse_cli_mount_spec_accepts_source_destination_options() {
+        let temp_root = unique_temp_path("cli-mount-spec");
+        let mount_source = temp_root.join("var/spool/slurmd");
+        fs::create_dir_all(&mount_source).unwrap();
+
+        let mount = parse_cli_mount_spec(&format!(
+            "{}:/var/spool/slurmd:bind,rw,nosuid,noexec,nodev,private",
+            mount_source.display()
+        ))
+        .unwrap();
+
+        assert_eq!(
+            mount,
+            ExtraMountEdit {
+                source: mount_source,
+                destination: PathBuf::from("/var/spool/slurmd"),
+                mount_type: "bind".to_string(),
+                options: vec![
+                    "bind".to_string(),
+                    "rw".to_string(),
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "nodev".to_string(),
+                    "private".to_string(),
+                ],
+            }
+        );
+
+        fs::remove_dir_all(&temp_root).unwrap();
+    }
+
+    #[test]
+    fn cli_overrides_parse_repeated_entries() {
+        let temp_root = unique_temp_path("cli-overrides");
+        let primary = temp_root.join("host/libmpi.so.12.5");
+        let dependency = temp_root.join("host/libpcitest.so.1.0.0");
+        let extra_file = temp_root.join("etc/libibverbs.d/mlx5.driver");
+        let extra_mount_source = temp_root.join("var/spool/slurmd");
+        fs::create_dir_all(primary.parent().unwrap()).unwrap();
+        fs::create_dir_all(extra_file.parent().unwrap()).unwrap();
+        fs::create_dir_all(&extra_mount_source).unwrap();
+        fs::write(&primary, b"payload").unwrap();
+        fs::write(&dependency, b"payload").unwrap();
+        fs::write(&extra_file, b"driver mlx5\n").unwrap();
+
+        let overrides = parse_cli_overrides_from_args(vec![
+            "--ldconfig=/sbin/ldconfig".into(),
+            format!("--lib={}", primary.display()).into(),
+            format!("--dependency-lib={}", dependency.display()).into(),
+            format!("--file={}", extra_file.display()).into(),
+            "--env=MPIR_CVAR_CH4_OFI_MULTI_NIC_STRIPING_THRESHOLD=100000000".into(),
+            format!(
+                "--mount={}:/var/spool/slurmd:bind,rw,nosuid,noexec,nodev,private",
+                extra_mount_source.display()
+            )
+            .into(),
+        ])
+        .unwrap();
+
+        assert_eq!(overrides.ldconfig, Some(PathBuf::from("/sbin/ldconfig")));
+        assert_eq!(overrides.primary_libs, vec![Library::parse_host(&primary).unwrap()]);
+        assert_eq!(
+            overrides.dependency_libs,
+            vec![Library::parse_host(&dependency).unwrap()]
+        );
+        assert_eq!(overrides.extra_files, vec![extra_file]);
+        assert_eq!(
+            overrides.extra_env,
+            vec!["MPIR_CVAR_CH4_OFI_MULTI_NIC_STRIPING_THRESHOLD=100000000".to_string()]
+        );
+        assert_eq!(
+            overrides.extra_mounts,
+            vec![ExtraMountEdit {
+                source: extra_mount_source,
+                destination: PathBuf::from("/var/spool/slurmd"),
+                mount_type: "bind".to_string(),
+                options: vec![
+                    "bind".to_string(),
+                    "rw".to_string(),
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "nodev".to_string(),
+                    "private".to_string(),
+                ],
+            }]
+        );
+
+        fs::remove_dir_all(&temp_root).unwrap();
+    }
+
+    #[test]
+    fn load_inputs_prefers_cli_values_over_env() {
+        let temp_root = unique_temp_path("load-inputs-cli-precedence");
+        let rootfs = temp_root.join("rootfs");
+        let cli_primary = temp_root.join("host/libmpi.so.12.5");
+        let env_primary = temp_root.join("host/libenvmpi.so.9.1");
+        let cli_file = temp_root.join("etc/libibverbs.d/mlx5.driver");
+        let env_file = temp_root.join("etc/libibverbs.d/env.driver");
+        let cli_mount_source = temp_root.join("var/spool/slurmd");
+        let env_mount_source = temp_root.join("var/lib/hugetlbfs");
+        fs::create_dir_all(&rootfs).unwrap();
+        fs::create_dir_all(cli_primary.parent().unwrap()).unwrap();
+        fs::create_dir_all(cli_file.parent().unwrap()).unwrap();
+        fs::create_dir_all(env_file.parent().unwrap()).unwrap();
+        fs::create_dir_all(&cli_mount_source).unwrap();
+        fs::create_dir_all(&env_mount_source).unwrap();
+        fs::write(&cli_primary, b"payload").unwrap();
+        fs::write(&env_primary, b"payload").unwrap();
+        fs::write(&cli_file, b"driver mlx5\n").unwrap();
+        fs::write(&env_file, b"driver env\n").unwrap();
+
+        std::env::set_var("LDCONFIG_PATH", "/env/ldconfig");
+        std::env::set_var("INJECTION_PRIMARY_LIBS", env_primary.as_os_str());
+        std::env::set_var("INJECTION_EXTRA_FILES", env_file.as_os_str());
+        std::env::set_var(
+            "INJECTION_EXTRA_ENV",
+            "ENV_ONLY_SHOULD_BE_IGNORED=1",
+        );
+        std::env::set_var(
+            "INJECTION_EXTRA_MOUNTS",
+            format!(
+                "{}:/var/lib/hugetlbfs:bind:bind,rw,nosuid,nodev,private",
+                env_mount_source.display()
+            ),
+        );
+
+        let config = serde_json::json!({
+            "root": { "path": rootfs.display().to_string() }
+        });
+        let cli = parse_cli_overrides_from_args(vec![
+            "--ldconfig=/cli/ldconfig".into(),
+            format!("--lib={}", cli_primary.display()).into(),
+            format!("--file={}", cli_file.display()).into(),
+            "--env=CLI_WINS=1".into(),
+            format!(
+                "--mount={}:/var/spool/slurmd:bind,rw,nosuid,noexec,nodev,private",
+                cli_mount_source.display()
+            )
+            .into(),
+        ])
+        .unwrap();
+
+        let inputs = load_inputs_from_sources(&config, cli).unwrap();
+
+        assert_eq!(inputs.ldconfig, PathBuf::from("/cli/ldconfig"));
+        assert_eq!(
+            inputs.primary_libs,
+            vec![Library::parse_host(&cli_primary).unwrap()]
+        );
+        assert_eq!(inputs.extra_files, vec![cli_file]);
+        assert_eq!(inputs.extra_env, vec!["CLI_WINS=1".to_string()]);
+        assert_eq!(
+            inputs.extra_mounts,
+            vec![ExtraMountEdit {
+                source: cli_mount_source,
+                destination: PathBuf::from("/var/spool/slurmd"),
+                mount_type: "bind".to_string(),
+                options: vec![
+                    "bind".to_string(),
+                    "rw".to_string(),
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "nodev".to_string(),
+                    "private".to_string(),
+                ],
+            }]
+        );
+
+        std::env::remove_var("LDCONFIG_PATH");
+        std::env::remove_var("INJECTION_PRIMARY_LIBS");
+        std::env::remove_var("INJECTION_EXTRA_FILES");
+        std::env::remove_var("INJECTION_EXTRA_ENV");
+        std::env::remove_var("INJECTION_EXTRA_MOUNTS");
+        fs::remove_dir_all(&temp_root).unwrap();
+    }
+
+    #[test]
     fn validate_inputs_allows_dependency_only_and_rejects_empty_library_inputs() {
         let base = HookInputs {
             rootfs: PathBuf::from("/rootfs"),
@@ -1969,13 +2210,12 @@ mod tests {
             extra_files: Vec::new(),
             extra_mounts: Vec::new(),
             extra_env: Vec::new(),
-            _compatibility_policy: CompatibilityPolicy::Major,
         };
 
         let error = validate_inputs(&base).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "at least one of INJECTION_PRIMARY_LIBS or INJECTION_DEPENDENCY_LIBS must be non-empty"
+            "at least one primary library (--lib or INJECTION_PRIMARY_LIBS) or dependency library (--dependency-lib or INJECTION_DEPENDENCY_LIBS) must be provided"
         );
 
         let temp_root = unique_temp_path("validate-inputs-dependency-only");

@@ -29,6 +29,51 @@ Always deciding replacement if ABI mayor is respected, otherwise it does directo
   prestart `ldconfig -r <rootfs>` run does not see runtime-only bind mounts. New lib injection are
   exposed through a host-side staging directory mounted at `/run/pc-injection/<library>`.
 
+
+## Hook args
+
+The hook can also read repeated `args` entries from the OCI hook config. This keeps multi-line
+hook definitions readable and avoids packing repeated values into semicolon-delimited env vars.
+
+Supported args:
+
+* `--ldconfig=/path/to/ldconfig`
+* `--lib=/host/path/to/libfoo.so.1.2.3`
+* `--dependency-lib=/host/path/to/libbar.so.1.0.0`
+* `--file=/absolute/host/path`
+* `--env=KEY=VALUE`
+* `--mount=/source:/destination:bind,rw,nosuid,noexec,nodev,private`
+
+Example:
+
+```json
+{
+  "version": "1.0.0",
+  "hook": {
+    "path": "/opt/hooks/pc_injection_hook",
+    "args": [
+      "pc_injection_hook",
+      "--ldconfig=/sbin/ldconfig",
+      "--lib=/host/lib/libmpi.so.12.0.1",
+      "--lib=/host/lib/libxyz.so.0.0.0",
+      "--dependency-lib=/host/lib/libpcitest.so.1.0.0",
+      "--file=/etc/awesome_assets/abc.driver",
+      "--env=MPIR_CVAR_CH4_OFI_MULTI_NIC_STRIPING_THRESHOLD=100000000",
+      "--env=ANOTHER_VARIABLE=42",
+      "--mount=/var/spool/slurmd:/var/spool/slurmd:bind,rw,nosuid,noexec,nodev,private",
+      "--mount=/var/lib/hugetlbfs:/var/lib/hugetlbfs:bind:rbind,rw,nosuid,nodev,private",
+      "--mount=/tmp:/tmp:bind,rw,nosuid,noexec,nodev,private"
+    ]
+  },
+  "when": {
+    "annotations": {
+      "com.hook.test.enabled": "^true$"
+    }
+  },
+  "stages": ["precreate"]
+}
+```
+
 ## Optional hook env vars
 
 * `INJECTION_EXTRA_ENV`: semicolon-separated `KEY=VALUE` entries.
