@@ -16,13 +16,18 @@ Add args entries as needed in the OCI hook `args` array. `--lib`, `--dependency-
 
 * `--ldconfig=/path/to/ldconfig`
   Specify the ldconfig binary on host to use by the hook, needed for manipulating the ld cache from the container bundle.
+* `--allow-unversioned-primary-overwrite`
+  Allow primary libraries without a versioned filename such as `libnccl.so` to overwrite
+  same-name container library paths directly. This only affects primary libraries that do not
+  encode a major ABI in the filename. If no same-name container path is found, the hook still
+  falls back to `/run/pc-injection` and `LD_LIBRARY_PATH`.
 * `--lib=/host/path/to/libfoo.so.1.2.3`
   Use for primary libraries you want the container to use. If the container already exposes the
   same SONAME with the same major ABI, the hook mounts over every matching container path.
   Otherwise it injects the
   library through `/run/pc-injection` and updates `LD_LIBRARY_PATH`. Primary libraries must include
-  at least a major ABI version. When fallback injection is used, symlink sources are resolved to
-  the real library file.
+  at least a major ABI version unless `--allow-unversioned-primary-overwrite` is set. When
+  fallback injection is used, symlink sources are resolved to the real library file.
 * `--dependency-lib=/host/path/to/libbar.so.1.0.0`
   Use for supporting libraries that should be added without replacing container library paths. These
   are always injected through `/run/pc-injection` and `LD_LIBRARY_PATH`. A major ABI version is not

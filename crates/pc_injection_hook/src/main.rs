@@ -90,6 +90,7 @@ struct HookInputs {
     ldconfig: PathBuf,
     primary_libs: Vec<Library>,
     dependency_libs: Vec<Library>,
+    allow_unversioned_primary_overwrite: bool,
     extra_files: Vec<PathBuf>,
     extra_mounts: Vec<ExtraMountEdit>,
     extra_env: Vec<String>,
@@ -100,6 +101,7 @@ struct CliOverrides {
     ldconfig: Option<PathBuf>,
     primary_libs: Vec<Library>,
     dependency_libs: Vec<Library>,
+    allow_unversioned_primary_overwrite: bool,
     extra_files: Vec<PathBuf>,
     extra_mounts: Vec<ExtraMountEdit>,
     extra_env: Vec<String>,
@@ -212,6 +214,7 @@ fn load_inputs_from_sources(config: &Value, cli: CliOverrides) -> Result<HookInp
         ldconfig: cli.ldconfig.unwrap_or(env_ldconfig),
         primary_libs: prefer_cli_vec(cli.primary_libs, env_primary_libs),
         dependency_libs: prefer_cli_vec(cli.dependency_libs, env_dependency_libs),
+        allow_unversioned_primary_overwrite: cli.allow_unversioned_primary_overwrite,
         extra_files: prefer_cli_vec(cli.extra_files, env_extra_files),
         extra_mounts: prefer_cli_vec(cli.extra_mounts, env_extra_mounts),
         extra_env: prefer_cli_vec(cli.extra_env, env_extra_env),
@@ -245,6 +248,8 @@ where
             overrides
                 .dependency_libs
                 .push(Library::parse_host(value)?);
+        } else if arg == "--allow-unversioned-primary-overwrite" {
+            overrides.allow_unversioned_primary_overwrite = true;
         } else if let Some(value) = arg.strip_prefix("--file=") {
             overrides.extra_files.push(PathBuf::from(value));
         } else if let Some(value) = arg.strip_prefix("--env=") {
@@ -655,7 +660,7 @@ fn plan_config_edits(inputs: &HookInputs, container_libs: &[Library]) -> Result<
     // check injection has major ABI
     for lib in &inputs.primary_libs {
         validate_regular_source_file(lib.path(), "primary library")?;
-        if !lib.has_major_version() {
+        if !lib.has_major_version() && !inputs.allow_unversioned_primary_overwrite {
             return Err(Error::message(format!(
                 "primary library {} must contain at least a major ABI number",
                 lib.path().display()
@@ -670,14 +675,22 @@ fn plan_config_edits(inputs: &HookInputs, container_libs: &[Library]) -> Result<
             .cloned()
             .unwrap_or_default();
 
-        if !candidates.is_empty() && !candidates.iter().any(Library::has_major_version) {
+        if host.has_major_version()
+            && !candidates.is_empty()
+            && !candidates.iter().any(Library::has_major_version)
+        {
             return Err(Error::message(format!(
                 "container libraries matching {} must contain at least a major ABI number",
                 host.path().display()
             )));
         }
 
-        let decision = choose_primary_mounts(host, &candidates, &fallback_dir)?;
+        let decision = choose_primary_mounts(
+            host,
+            &candidates,
+            &fallback_dir,
+            inputs.allow_unversioned_primary_overwrite,
+        )?;
         append_decision_mounts(
             &mut mounts,
             &mut ld_library_path_dirs,
@@ -757,7 +770,19 @@ fn choose_primary_mounts(
     host: &Library,
     candidates: &[Library],
     fallback_dir: &Path,
+    allow_unversioned_primary_overwrite: bool,
 ) -> Result<MountDecision> {
+    if !host.has_major_version() {
+        if allow_unversioned_primary_overwrite {
+            return choose_same_name_mounts(host, candidates, fallback_dir);
+        }
+
+        return Err(Error::message(format!(
+            "primary library {} must contain at least a major ABI number",
+            host.path().display()
+        )));
+    }
+
     choose_same_major_mounts(host, candidates, fallback_dir)
 }
 
@@ -813,6 +838,35 @@ fn choose_same_major_mounts(
     }
 
     overwrite_mount_decision(host, &same_major_candidates, warnings)
+}
+
+fn choose_same_name_mounts(
+    host: &Library,
+    candidates: &[Library],
+    fallback_dir: &Path,
+) -> Result<MountDecision> {
+    let warnings = vec![format!(
+        "unversioned primary overwrite enabled for {}; matching same-name container libraries only",
+        host.real_name()
+    )];
+    let same_name_candidates = candidates
+        .iter()
+        .filter(|candidate| candidate.linker_name() == host.linker_name())
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if same_name_candidates.is_empty() {
+        let mut warnings = warnings;
+        warnings.push(format!(
+            "no same-name container match found for unversioned host library {}; mounting {} into {} with LD_LIBRARY_PATH",
+            host.real_name(),
+            host.path().display(),
+            fallback_dir.display()
+        ));
+        return fallback_mount_decision(host, fallback_dir, warnings);
+    }
+
+    overwrite_mount_decision(host, &same_name_candidates, warnings)
 }
 
 // Here we build the mountEdit to overwrite lib with host
@@ -1509,6 +1563,7 @@ mod tests {
             ldconfig: "ldconfig".into(),
             primary_libs: vec![Library::parse_host(&host_file).unwrap()],
             dependency_libs: Vec::new(),
+            allow_unversioned_primary_overwrite: false,
             extra_files: Vec::new(),
             extra_mounts: Vec::new(),
             extra_env: Vec::new(),
@@ -1564,6 +1619,7 @@ mod tests {
             ldconfig: "ldconfig".into(),
             primary_libs: vec![Library::parse_host(&host_file).unwrap()],
             dependency_libs: Vec::new(),
+            allow_unversioned_primary_overwrite: false,
             extra_files: Vec::new(),
             extra_mounts: Vec::new(),
             extra_env: Vec::new(),
@@ -1615,6 +1671,7 @@ mod tests {
             ldconfig: "ldconfig".into(),
             primary_libs: vec![Library::parse_host(&host_file).unwrap()],
             dependency_libs: Vec::new(),
+            allow_unversioned_primary_overwrite: false,
             extra_files: Vec::new(),
             extra_mounts: Vec::new(),
             extra_env: Vec::new(),
@@ -1662,6 +1719,7 @@ mod tests {
             ldconfig: "ldconfig".into(),
             primary_libs: vec![Library::parse_host(&primary).unwrap()],
             dependency_libs: vec![Library::parse_host(&dependency).unwrap()],
+            allow_unversioned_primary_overwrite: false,
             extra_files: Vec::new(),
             extra_mounts: Vec::new(),
             extra_env: Vec::new(),
@@ -1876,6 +1934,7 @@ mod tests {
             ldconfig,
             primary_libs: vec![Library::parse_host(&host_file).unwrap()],
             dependency_libs: Vec::new(),
+            allow_unversioned_primary_overwrite: false,
             extra_files: Vec::new(),
             extra_mounts: Vec::new(),
             extra_env: Vec::new(),
@@ -1908,6 +1967,7 @@ mod tests {
             ldconfig: "ldconfig".into(),
             primary_libs: vec![Library::parse_host(&primary).unwrap()],
             dependency_libs: Vec::new(),
+            allow_unversioned_primary_overwrite: false,
             extra_files: vec![extra.clone()],
             extra_mounts: Vec::new(),
             extra_env: Vec::new(),
@@ -2089,6 +2149,7 @@ mod tests {
             overrides.dependency_libs,
             vec![Library::parse_host(&dependency).unwrap()]
         );
+        assert!(!overrides.allow_unversioned_primary_overwrite);
         assert_eq!(overrides.extra_files, vec![extra_file]);
         assert_eq!(
             overrides.extra_env,
@@ -2173,6 +2234,7 @@ mod tests {
             inputs.primary_libs,
             vec![Library::parse_host(&cli_primary).unwrap()]
         );
+        assert!(!inputs.allow_unversioned_primary_overwrite);
         assert_eq!(inputs.extra_files, vec![cli_file]);
         assert_eq!(inputs.extra_env, vec!["CLI_WINS=1".to_string()]);
         assert_eq!(
@@ -2207,6 +2269,7 @@ mod tests {
             ldconfig: "ldconfig".into(),
             primary_libs: Vec::new(),
             dependency_libs: Vec::new(),
+            allow_unversioned_primary_overwrite: false,
             extra_files: Vec::new(),
             extra_mounts: Vec::new(),
             extra_env: Vec::new(),

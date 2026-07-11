@@ -397,6 +397,234 @@ EOF
   rm -rf "$workdir" "$hooks_dir"
 }
 
+@test "pc_injection_hook accepts args-based unversioned primary overwrite in Podman" {
+  : "${IMAGE:=ubuntu:24.04}"
+
+  podman pull "$IMAGE" >/dev/null
+
+  run command -v gcc
+  assert_success
+  gcc_path="$output"
+
+  run command -v ldconfig
+  assert_success
+  ldconfig_path="$output"
+
+  workdir="$(mktemp -d)"
+  host_src="$workdir/libpciflag-host.c"
+  host_lib="$workdir/libpciflag.so"
+  image_src="$workdir/libpciflag-image.c"
+  image_lib="$workdir/libpciflag-image.so"
+  containerfile="$workdir/Containerfile"
+  hooks_dir="$(mktemp -d)"
+  image_tag="pc-injection-unversioned-primary-$$:latest"
+
+  cat >"$host_src" <<'EOF'
+const char *pciflag_marker(void) { return "host-marker"; }
+EOF
+
+  cat >"$image_src" <<'EOF'
+const char *pciflag_marker(void) { return "container-marker"; }
+EOF
+
+  run "$gcc_path" -shared -fPIC -Wl,-soname,libpciflag.so -o "$host_lib" "$host_src"
+  assert_success
+
+  run "$gcc_path" -shared -fPIC -Wl,-soname,libpciflag.so -o "$image_lib" "$image_src"
+  assert_success
+
+  cat >"$containerfile" <<EOF
+FROM $IMAGE
+COPY $(basename "$image_lib") /usr/local/lib/libpciflag.so
+RUN ldconfig
+EOF
+
+  run podman build -t "$image_tag" -f "$containerfile" "$workdir"
+  assert_success
+
+  repo="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  bin="$repo/target/release/pc_injection_hook"
+  [ -x "$bin" ]
+
+  cat >"$hooks_dir/pc-injection.json" <<EOF
+{
+  "version": "1.0.0",
+  "hook": {
+    "path": "$bin",
+    "args": [
+      "pc_injection_hook",
+      "--ldconfig=$ldconfig_path",
+      "--lib=$host_lib",
+      "--allow-unversioned-primary-overwrite"
+    ]
+  },
+  "when": {
+    "annotations": {
+      "pc-injection.enable": "^true$"
+    }
+  },
+  "stages": ["precreate"]
+}
+EOF
+
+  run podman --hooks-dir="$hooks_dir" run --rm \
+    --annotation pc-injection.enable=true \
+    "$image_tag" bash -lc '
+      printf "LD_LIBRARY_PATH=%s\n" "${LD_LIBRARY_PATH:-}"
+      printf "hook-target=%s\n" /usr/local/lib/libpciflag.so
+      grep -aoE "host-marker|container-marker" /usr/local/lib/libpciflag.so || true
+      [ -z "${LD_LIBRARY_PATH:-}" ] &&
+      [ ! -e /run/pc-injection/libpciflag.so ] &&
+      grep -aq "host-marker" /usr/local/lib/libpciflag.so &&
+      ! grep -aq "container-marker" /usr/local/lib/libpciflag.so
+    '
+
+  assert_success
+  assert_output --partial "LD_LIBRARY_PATH="
+  assert_output --partial "hook-target=/usr/local/lib/libpciflag.so"
+  assert_output --partial "host-marker"
+
+  podman image rm -f "$image_tag" >/dev/null 2>&1 || true
+  rm -rf "$workdir" "$hooks_dir"
+}
+
+@test "pc_injection_hook rejects unversioned primary without flag in Podman" {
+  : "${IMAGE:=ubuntu:24.04}"
+
+  podman pull "$IMAGE" >/dev/null
+
+  run command -v gcc
+  assert_success
+  gcc_path="$output"
+
+  run command -v ldconfig
+  assert_success
+  ldconfig_path="$output"
+
+  workdir="$(mktemp -d)"
+  host_src="$workdir/libpciflag-host.c"
+  host_lib="$workdir/libpciflag.so"
+  hooks_dir="$(mktemp -d)"
+  hook_stderr="$workdir/hook.stderr"
+
+  cat >"$host_src" <<'EOF'
+const char *pciflag_marker(void) { return "host-marker"; }
+EOF
+
+  run "$gcc_path" -shared -fPIC -Wl,-soname,libpciflag.so -o "$host_lib" "$host_src"
+  assert_success
+
+  repo="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  bin="$repo/target/release/pc_injection_hook"
+  [ -x "$bin" ]
+
+  cat >"$hooks_dir/pc-injection.json" <<EOF
+{
+  "version": "1.0.0",
+  "hook": {
+    "path": "$bin",
+    "args": [
+      "pc_injection_hook",
+      "--ldconfig=$ldconfig_path",
+      "--lib=$host_lib"
+    ]
+  },
+  "when": {
+    "annotations": {
+      "pc-injection.enable": "^true$"
+    }
+  },
+  "stages": ["precreate"]
+}
+EOF
+
+  run podman --hooks-dir="$hooks_dir" run --rm \
+    --runtime=crun \
+    --annotation pc-injection.enable=true \
+    --annotation run.oci.hooks.stderr="$hook_stderr" \
+    "$IMAGE" true
+
+  assert_failure
+  if [ -f "$hook_stderr" ]; then
+    run grep -F "must contain at least a major ABI number" "$hook_stderr"
+    assert_success
+  else
+    assert_output --partial "precreate hook"
+  fi
+
+  rm -rf "$workdir" "$hooks_dir"
+}
+
+@test "pc_injection_hook falls back for unversioned primary without same-name container lib in Podman" {
+  : "${IMAGE:=ubuntu:24.04}"
+
+  podman pull "$IMAGE" >/dev/null
+
+  run command -v gcc
+  assert_success
+  gcc_path="$output"
+
+  run command -v ldconfig
+  assert_success
+  ldconfig_path="$output"
+
+  workdir="$(mktemp -d)"
+  host_src="$workdir/libpciflag-host.c"
+  host_lib="$workdir/libpciflag.so"
+  hooks_dir="$(mktemp -d)"
+
+  cat >"$host_src" <<'EOF'
+const char *pciflag_marker(void) { return "host-marker"; }
+EOF
+
+  run "$gcc_path" -shared -fPIC -Wl,-soname,libpciflag.so -o "$host_lib" "$host_src"
+  assert_success
+
+  repo="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  bin="$repo/target/release/pc_injection_hook"
+  [ -x "$bin" ]
+
+  cat >"$hooks_dir/pc-injection.json" <<EOF
+{
+  "version": "1.0.0",
+  "hook": {
+    "path": "$bin",
+    "args": [
+      "pc_injection_hook",
+      "--ldconfig=$ldconfig_path",
+      "--lib=$host_lib",
+      "--allow-unversioned-primary-overwrite"
+    ]
+  },
+  "when": {
+    "annotations": {
+      "pc-injection.enable": "^true$"
+    }
+  },
+  "stages": ["precreate"]
+}
+EOF
+
+  run podman --hooks-dir="$hooks_dir" run --rm \
+    --annotation pc-injection.enable=true \
+    "$IMAGE" bash -lc '
+      printf "LD_LIBRARY_PATH=%s\n" "${LD_LIBRARY_PATH:-}"
+      printf "fallback-target=%s\n" /run/pc-injection/libpciflag.so/libpciflag.so
+      grep -aoE "host-marker|container-marker" /run/pc-injection/libpciflag.so/libpciflag.so || true
+      [ "${LD_LIBRARY_PATH:-}" = "/run/pc-injection/libpciflag.so" ] &&
+      [ -d /run/pc-injection/libpciflag.so ] &&
+      [ -f /run/pc-injection/libpciflag.so/libpciflag.so ] &&
+      grep -aq "host-marker" /run/pc-injection/libpciflag.so/libpciflag.so
+    '
+
+  assert_success
+  assert_output --partial "LD_LIBRARY_PATH=/run/pc-injection/libpciflag.so"
+  assert_output --partial "fallback-target=/run/pc-injection/libpciflag.so/libpciflag.so"
+  assert_output --partial "host-marker"
+
+  rm -rf "$workdir" "$hooks_dir"
+}
+
 @test "pc_injection_hook stages symlinked dependency as real file plus alias in Podman" {
   : "${IMAGE:=ubuntu:24.04}"
 
