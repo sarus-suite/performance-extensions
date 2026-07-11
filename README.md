@@ -8,12 +8,16 @@ Annotation-driven. Fully static binaries. Works on any Linux node.
 ## Why it matters
 
 * **Accelerators on demand:** Enable accelerated libraries, MPS, extra mounts, env tweaks — per container — via annotations.
+* **Host stack injection for containers:** Replace or augment container-visible libfabric, NCCL, network, and Slurm runtime pieces from the host without rebuilding images.
 * **Cluster-friendly:** Static builds = zero runtime deps. Drop the binaries onto heterogeneous systems.
 * **Least surprise:** Control hook execution from the Sarus EDF via annotation conditions match. No image changes needed.
 
 
 
 ## Hooks
+
+* *Precreate stack injection* [(pc_injection_hook)](https://github.com/sarus-suite/performance-extensions/tree/main/crates/pc_injection_hook)
+  Key precreate hook for injecting or replacing host-side HPC stack components inside containers, including primary and dependency libraries, files, env vars, and bind mounts. This is the main mechanism for swapping in host libfabric, NCCL, network-related runtime bits, and Slurm paths without rebuilding the container image. See the [hook README](https://github.com/sarus-suite/performance-extensions/tree/main/crates/pc_injection_hook) for the supported injection model and configuration details.
 
 * *Precreate Container Edits* [(pce_hook)](https://github.com/sarus-suite/performance-extensions/tree/main/crates/pce_hook)
   Reads container config from `stdin`, applies env + mount edits from `PCE_INPUT`, writes updated config to `stdout`. Use at `createContainer`.
@@ -82,4 +86,3 @@ devcontainer exec --workspace-folder . cargo build --release
 ```bash
 bats test
 ```
-
