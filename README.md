@@ -26,7 +26,7 @@ Annotation-driven. Fully static binaries. Works on any Linux node.
   On `prestart`, runs `ldconfig -v -r <rootfs>` (override with `LDCONFIG_PATH`).
 
 * *NVIDIA MPS bootstrap* [(mps_hook)](https://github.com/sarus-suite/performance-extensions/tree/main/crates/mps_hook)
-  Starts `nvidia-cuda-mps-control -d`, checks per-UID server, returns helpful exit codes.
+  Starts or contacts `nvidia-cuda-mps-control`, asks it to start a per-UID MPS server, returns helpful exit codes.
 
 
 

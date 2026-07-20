@@ -29,7 +29,17 @@ teardown() {
 
 # MPS wrapped calls for clarity
 mps_is_running() {
-  ps -eo uid=,comm= | grep -qE "^[[:space:]]*$(id -u)[[:space:]]+nvidia-cuda-mps-server$"
+  ps -eo uid=,args= \
+    | awk -v uid="$(id -u)" '
+        $1 == uid {
+          $1 = ""
+          sub(/^[[:space:]]+/, "")
+          if ($0 ~ /(^|\/)nvidia-cuda-mps-server([[:space:]]|$)/) {
+            found = 1
+          }
+        }
+        END { exit found ? 0 : 1 }
+      '
 }
 
 mps_start() {
@@ -51,6 +61,11 @@ path_without_control() {
 
 # Test should repport if nvidia mps server is not available!
 @test "MPS_HOOK returns error if control binary not in PATH" {
+  if mps_is_running; then
+    mps_stop
+  fi
+  mps_is_running && skip "Could not stop MPS server; cannot validate missing control binary path"
+
   PATH_BACKUP="$PATH"
   PATH="$(path_without_control)"
 
@@ -59,7 +74,7 @@ path_without_control() {
   # restore PATH immediately
   PATH="$PATH_BACKUP"
 
-  // We assert status and print any unexpected error
+  # We assert status and print any unexpected error
   [ "$status" -eq 127 ] || { echo "---stderr---" >&3; printf '%s\n' "$stderr" >&3; }
 }
 
@@ -77,8 +92,8 @@ path_without_control() {
 
 @test "MPS_HOOK ok if server down and then starts it" {
   # check server is stopped if not stop it
-  if mps_is_running
-    then mps_stop
+  if mps_is_running; then
+    mps_stop
   fi
   mps_is_running && skip "Could not stop MPS server; cannot validate start path"
 
@@ -88,4 +103,3 @@ path_without_control() {
   # We check again and it should be up
   mps_is_running
 }
-

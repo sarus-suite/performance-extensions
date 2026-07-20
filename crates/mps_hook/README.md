@@ -4,8 +4,8 @@ Ensure an **NVIDIA MPS** server is running for the current UID before your conta
 
 **What it does**
 
-* Tries to start `nvidia-cuda-mps-control -d`. If missing, exits `127` with a clear message. 
-* Checks if `nvidia-cuda-mps-server` is already running **for this UID**; if yes, exits **0** (noop). Retries once if needed. 
+* Starts or contacts `nvidia-cuda-mps-control -d`. If missing, exits `127` with a clear message.
+* Asks the control daemon to start an MPS server for the current UID. Retries once if needed.
 * Fails cleanly with diagnostics if the server won’t come up. 
 
 ## Usage as a Podman hook
@@ -30,7 +30,6 @@ Run at **prestart** and gate with an annotation:
 
 ## Behavior & exit codes
 
-* **0**: MPS server is already running for this UID, or started successfully. 
-* **1**: Unexpected failure (e.g., could not start or re-check failed). 
+* **0**: MPS server for this UID was accepted by the control daemon.
+* **1**: Unexpected failure (e.g., could not start or contact the control daemon).
 * **127**: `nvidia-cuda-mps-control` not found in `PATH`. 
-
