@@ -20,7 +20,8 @@ Annotation-driven. Fully static binaries. Works on any Linux node.
   Key precreate hook for injecting or replacing host-side HPC stack components inside containers, including primary and dependency libraries, files, env vars, and bind mounts. This is the main mechanism for swapping in host libfabric, NCCL, network-related runtime bits, and Slurm paths without rebuilding the container image. See the [hook README](https://github.com/sarus-suite/performance-extensions/tree/main/crates/pc_injection_hook) for the supported injection model and configuration details.
 
 * *Precreate Container Edits* [(pce_hook)](https://github.com/sarus-suite/performance-extensions/tree/main/crates/pce_hook)
-  Reads container config from `stdin`, applies env + mount edits from `PCE_INPUT`, writes updated config to `stdout`. Use at `createContainer`.
+  Reads container config from `stdin`, applies env + mount edits from `PCE_INPUT`, and writes the
+  updated config to `stdout` during Podman's `precreate` stage.
 
 * *Refresh loader cache* [(ldcache_hook)](https://github.com/sarus-suite/performance-extensions/tree/main/crates/ldcache_hook)
   On `prestart`, runs `ldconfig -v -r <rootfs>` (override with `LDCONFIG_PATH`).
