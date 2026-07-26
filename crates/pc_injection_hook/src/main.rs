@@ -4,12 +4,19 @@ use std::env;
 use std::error::Error as StdError;
 use std::ffi::OsStr;
 use std::fmt;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::symlink;
 use std::path::{Component, Path, PathBuf};
 use std::process::{self, Command};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+fn log_to_file<P: AsRef<Path>>(path: P, message: &str) -> io::Result<()> {
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+
+    writeln!(file, "{message}")?;
+    Ok(())
+}
 
 fn main() {
     match run() {
@@ -22,11 +29,21 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    log_to_file("/tmp/pc-injection-hook-log.txt", "Reading stdin json").unwrap();
     let mut config = read_stdin_json_value()?;
+    log_to_file("/tmp/pc-injection-hook-log.txt", "Loading inputs").unwrap();
     let inputs = load_inputs(&config)?;
+    log_to_file(
+        "/tmp/pc-injection-hook-log.txt",
+        "Discovering container libraries",
+    )
+    .unwrap();
     let discovery = discover_container_libraries(&inputs)?;
+    log_to_file("/tmp/pc-injection-hook-log.txt", "Planning config edits").unwrap();
     let edits = plan_config_edits(&inputs, &discovery.libraries)?;
+    log_to_file("/tmp/pc-injection-hook-log.txt", "Applying config edits").unwrap();
     apply_config_edits(&mut config, &edits)?;
+    log_to_file("/tmp/pc-injection-hook-log.txt", "Writing stdout json").unwrap();
     write_stdout_json(&config)?;
 
     for warning in discovery.warnings.into_iter().chain(edits.warnings) {
@@ -194,6 +211,11 @@ fn load_inputs(config: &Value) -> Result<HookInputs> {
 }
 
 fn load_inputs_from_sources(config: &Value, cli: CliOverrides) -> Result<HookInputs> {
+    log_to_file(
+        "/tmp/pc-injection-hook-log.txt",
+        "Loading inputs: root path",
+    )
+    .unwrap();
     let root_path = config
         .get("root")
         .and_then(Value::as_object)
@@ -201,6 +223,11 @@ fn load_inputs_from_sources(config: &Value, cli: CliOverrides) -> Result<HookInp
         .and_then(Value::as_str)
         .ok_or_else(|| Error::message("OCI config is missing root.path"))?;
 
+    log_to_file(
+        "/tmp/pc-injection-hook-log.txt",
+        "Loading inputs: environment variables",
+    )
+    .unwrap();
     let env_ldconfig =
         PathBuf::from(env::var_os("LDCONFIG_PATH").unwrap_or_else(|| "ldconfig".into()));
     let env_primary_libs = parse_optional_library_list("INJECTION_PRIMARY_LIBS")?;
@@ -209,6 +236,11 @@ fn load_inputs_from_sources(config: &Value, cli: CliOverrides) -> Result<HookInp
     let env_extra_mounts = parse_optional_mount_specs("INJECTION_EXTRA_MOUNTS")?;
     let env_extra_env = parse_optional_env_specs("INJECTION_EXTRA_ENV")?;
 
+    log_to_file(
+        "/tmp/pc-injection-hook-log.txt",
+        "Loading inputs: CLI overrides",
+    )
+    .unwrap();
     let inputs = HookInputs {
         rootfs: resolve_rootfs(root_path)?,
         ldconfig: cli.ldconfig.unwrap_or(env_ldconfig),
@@ -220,6 +252,7 @@ fn load_inputs_from_sources(config: &Value, cli: CliOverrides) -> Result<HookInp
         extra_env: prefer_cli_vec(cli.extra_env, env_extra_env),
     };
 
+    log_to_file("/tmp/pc-injection-hook-log.txt", "Validating inputs").unwrap();
     validate_inputs(&inputs)?;
 
     Ok(inputs)
@@ -233,6 +266,11 @@ fn parse_cli_overrides_from_args<I>(args: I) -> Result<CliOverrides>
 where
     I: IntoIterator<Item = std::ffi::OsString>,
 {
+    log_to_file(
+        "/tmp/pc-injection-hook-log.txt",
+        "initializing cli overrides",
+    )
+    .unwrap();
     let mut overrides = CliOverrides::default();
 
     for arg in args {
@@ -240,14 +278,17 @@ where
             .into_string()
             .map_err(|_| Error::message("hook args must contain valid UTF-8"))?;
 
+        log_to_file(
+            "/tmp/pc-injection-hook-log.txt",
+            &("parsing arg ".to_owned() + &arg),
+        )
+        .unwrap();
         if let Some(value) = arg.strip_prefix("--ldconfig=") {
             overrides.ldconfig = Some(PathBuf::from(value));
         } else if let Some(value) = arg.strip_prefix("--lib=") {
             overrides.primary_libs.push(Library::parse_host(value)?);
         } else if let Some(value) = arg.strip_prefix("--dependency-lib=") {
-            overrides
-                .dependency_libs
-                .push(Library::parse_host(value)?);
+            overrides.dependency_libs.push(Library::parse_host(value)?);
         } else if arg == "--allow-unversioned-primary-overwrite" {
             overrides.allow_unversioned_primary_overwrite = true;
         } else if let Some(value) = arg.strip_prefix("--file=") {
@@ -263,6 +304,7 @@ where
         }
     }
 
+    log_to_file("/tmp/pc-injection-hook-log.txt", "parsed cli overrides").unwrap();
     Ok(overrides)
 }
 
@@ -297,7 +339,11 @@ fn validate_inputs(inputs: &HookInputs) -> Result<()> {
 }
 
 fn prefer_cli_vec<T>(cli: Vec<T>, env: Vec<T>) -> Vec<T> {
-    if cli.is_empty() { env } else { cli }
+    if cli.is_empty() {
+        env
+    } else {
+        cli
+    }
 }
 
 fn parse_optional_path_list(var: &'static str) -> Vec<PathBuf> {
@@ -365,10 +411,8 @@ fn parse_cli_mount_spec(entry: &str) -> Result<ExtraMountEdit> {
         )));
     }
 
-    let source = canonical_mount_source_path(
-        &PathBuf::from(parts[0].trim()),
-        "extra mount source",
-    )?;
+    let source =
+        canonical_mount_source_path(&PathBuf::from(parts[0].trim()), "extra mount source")?;
     let destination = PathBuf::from(parts[1].trim());
     let options = if parts[2].trim().is_empty() {
         Vec::new()
@@ -399,10 +443,8 @@ fn parse_mount_spec_entry(var: &'static str, entry: &str) -> Result<ExtraMountEd
         )));
     }
 
-    let source = canonical_mount_source_path(
-        &PathBuf::from(parts[0].trim()),
-        "extra mount source",
-    )?;
+    let source =
+        canonical_mount_source_path(&PathBuf::from(parts[0].trim()), "extra mount source")?;
     let destination = PathBuf::from(parts[1].trim());
     let mount_type = parts[2].trim();
     let options = if parts[3].trim().is_empty() {
@@ -2144,7 +2186,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(overrides.ldconfig, Some(PathBuf::from("/sbin/ldconfig")));
-        assert_eq!(overrides.primary_libs, vec![Library::parse_host(&primary).unwrap()]);
+        assert_eq!(
+            overrides.primary_libs,
+            vec![Library::parse_host(&primary).unwrap()]
+        );
         assert_eq!(
             overrides.dependency_libs,
             vec![Library::parse_host(&dependency).unwrap()]
@@ -2199,10 +2244,7 @@ mod tests {
         std::env::set_var("LDCONFIG_PATH", "/env/ldconfig");
         std::env::set_var("INJECTION_PRIMARY_LIBS", env_primary.as_os_str());
         std::env::set_var("INJECTION_EXTRA_FILES", env_file.as_os_str());
-        std::env::set_var(
-            "INJECTION_EXTRA_ENV",
-            "ENV_ONLY_SHOULD_BE_IGNORED=1",
-        );
+        std::env::set_var("INJECTION_EXTRA_ENV", "ENV_ONLY_SHOULD_BE_IGNORED=1");
         std::env::set_var(
             "INJECTION_EXTRA_MOUNTS",
             format!(
