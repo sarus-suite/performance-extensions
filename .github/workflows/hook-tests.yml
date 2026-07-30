@@ -26,9 +26,10 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
 
-    env:
-      TMP_DIR: ${{ runner.temp }}/hook-tests
     steps:
+      - name: Set temporary directory
+        run: echo "TMP_DIR=${{ runner.temp }}/hook-tests" >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@v6
 
