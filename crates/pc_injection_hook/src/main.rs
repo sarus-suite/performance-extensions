@@ -1547,6 +1547,9 @@ fn unique_temp_path(label: &str) -> PathBuf {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn fallback_primary_adds_mounts_and_ld_library_path() {
@@ -1990,6 +1993,7 @@ mod tests {
 
     #[test]
     fn parse_optional_env_specs_accepts_semicolon_separated_entries() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
         std::env::set_var(
             "INJECTION_EXTRA_ENV",
             "FOO=bar;MPIR_CVAR_CH4_OFI_MULTI_NIC_STRIPING_THRESHOLD=100000000",
@@ -2009,6 +2013,7 @@ mod tests {
 
     #[test]
     fn parse_optional_mount_specs_normalizes_bind_mounts() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
         let temp_root = unique_temp_path("extra-mount-spec");
         let mount_source = temp_root.join("var/spool/slurmd");
         fs::create_dir_all(&mount_source).unwrap();
@@ -2045,6 +2050,7 @@ mod tests {
 
     #[test]
     fn parse_optional_mount_specs_canonicalizes_symlink_sources() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
         let temp_root = unique_temp_path("extra-mount-symlink");
         let real_source = temp_root.join("real/slurmd");
         let symlink_source = temp_root.join("link/slurmd");
@@ -2177,6 +2183,7 @@ mod tests {
 
     #[test]
     fn load_inputs_prefers_cli_values_over_env() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
         let temp_root = unique_temp_path("load-inputs-cli-precedence");
         let rootfs = temp_root.join("rootfs");
         let cli_primary = temp_root.join("host/libmpi.so.12.5");

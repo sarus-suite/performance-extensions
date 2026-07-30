@@ -1,0 +1,154 @@
+name: hook tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  TMP_DIR: ${{ runner.temp }}/hook-tests
+  SARUS_SUITE_VERSION: v26.7.3
+
+jobs:
+  build-and-smoke-test:
+    name: build and smoke test hooks (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Prepare temporary workspace
+        run: |
+          set -euxo pipefail
+          mkdir -p "$TMP_DIR"
+
+      - name: Allow unprivileged user namespaces
+        run: |
+          set -euxo pipefail
+
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          fi
+
+          sysctl kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true
+          sysctl kernel.unprivileged_userns_clone 2>/dev/null || true
+          sysctl user.max_user_namespaces 2>/dev/null || true
+
+      - name: Check user namespaces availability
+        run: |
+          set -euxo pipefail
+
+          echo "== sysctls =="
+          cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || true
+          cat /proc/sys/user/max_user_namespaces 2>/dev/null || true
+
+          echo "== unshare probe =="
+          if unshare -Ur true 2>/dev/null; then
+            echo "unshare -Ur: OK (user namespaces usable)"
+          else
+            echo "unshare -Ur: FAIL (user namespaces not usable here)"
+            exit 1
+          fi
+
+          echo "== kernel config hint =="
+          zgrep CONFIG_USER_NS /proc/config.gz 2>/dev/null || true
+          grep CONFIG_USER_NS "/boot/config-$(uname -r)" 2>/dev/null || true
+
+      - name: Install host prerequisites
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl gcc git jq uidmap util-linux
+
+      - name: Install Bats locally
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://github.com/bats-core/bats-core.git "$TMP_DIR/bats-core"
+          "$TMP_DIR/bats-core/install.sh" "$TMP_DIR/bats"
+          echo "$TMP_DIR/bats/bin" >> "$GITHUB_PATH"
+        working-directory: ${{ env.TMP_DIR }}
+
+      - name: Build hooks in devcontainer
+        uses: devcontainers/ci@v0.3
+        with:
+          imageName: ghcr.io/${{ github.repository }}/devcontainer-${{ matrix.arch }}
+          cacheFrom: ghcr.io/${{ github.repository }}/devcontainer-${{ matrix.arch }}
+          push: never
+          runCmd: |
+            HOOKS_ARCH=${{ matrix.arch }} bash -euxo pipefail <<'EOF'
+            cargo test --workspace
+            cargo build --release
+
+            mkdir -p "dist/hooks-${HOOKS_ARCH}"
+            cp target/release/ldcache_hook      "dist/hooks-${HOOKS_ARCH}/ldcache_hook"
+            cp target/release/pce_hook          "dist/hooks-${HOOKS_ARCH}/pce_hook"
+            cp target/release/mps_hook          "dist/hooks-${HOOKS_ARCH}/mps_hook"
+            cp target/release/sethomevar        "dist/hooks-${HOOKS_ARCH}/sethomevar"
+            cp target/release/mkhomedir         "dist/hooks-${HOOKS_ARCH}/mkhomedir"
+            cp target/release/pc_injection_hook "dist/hooks-${HOOKS_ARCH}/pc_injection_hook"
+
+            ls -lah "dist/hooks-${HOOKS_ARCH}"
+            EOF
+
+
+      - name: Download Sarus Suite
+        run: |
+          set -euxo pipefail
+          extract_dir="$TMP_DIR/sarus-suite-extract"
+          archive="$TMP_DIR/sarus-suite-${SARUS_SUITE_VERSION}-${{ matrix.arch }}.tar.gz"
+          url="https://github.com/sarus-suite/sarus-suite/releases/download/${SARUS_SUITE_VERSION}/sarus-suite-${SARUS_SUITE_VERSION}-${{ matrix.arch }}.tar.gz"
+
+          mkdir -p "$extract_dir"
+          curl -fL "$url" -o "$archive"
+          tar -xzf "$archive" -C "$extract_dir"
+          find "$extract_dir" -path '*/bin/sarus-suite-shell' -type f -print -quit > "$TMP_DIR/sarus-suite-shell.path"
+
+          test -s "$TMP_DIR/sarus-suite-shell.path"
+          chmod +x "$(cat "$TMP_DIR/sarus-suite-shell.path")"
+
+      - name: Import built hooks into Sarus Suite
+        run: |
+          set -euxo pipefail
+
+          sarus_suite_shell="$(cat "$TMP_DIR/sarus-suite-shell.path")"
+          hooks_dir="$PWD/dist/hooks-${{ matrix.arch }}"
+
+          test -x "$hooks_dir/ldcache_hook"
+          test -x "$hooks_dir/pce_hook"
+          test -x "$hooks_dir/mps_hook"
+          test -x "$hooks_dir/sethomevar"
+          test -x "$hooks_dir/mkhomedir"
+          test -x "$hooks_dir/pc_injection_hook"
+
+          "$sarus_suite_shell" --import-hook-dir "$hooks_dir" -- sarus-suite-check
+
+      - name: Sarus Suite hook import smoke check
+        run: |
+          set -euxo pipefail
+
+          sarus_suite_shell="$(cat "$TMP_DIR/sarus-suite-shell.path")"
+          hooks_dir="$PWD/dist/hooks-${{ matrix.arch }}"
+
+          "$sarus_suite_shell" --import-hook-dir "$hooks_dir" -- bash -lc '
+            set -euxo pipefail
+            command -v ldcache_hook
+            command -v pce_hook
+            command -v mps_hook
+            command -v sethomevar
+            command -v mkhomedir
+            command -v pc_injection_hook
+          '
