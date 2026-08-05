@@ -7,6 +7,9 @@ use std::{
 use precreate_hook_diagnostics::{write_error, ExitStatus};
 use serde_json::{json, map::Entry, Map, Value};
 
+const REPLACE_DEFAULT_VALUE: bool = false;
+const REPLACE_ANNOTATION_NAME: &str = "com.hooks.sethomevar.override";
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error}");
@@ -51,12 +54,17 @@ fn run() -> Result<()> {
     let mut value = read_stdin_json()?;
     let obj = ensure_obj(value.as_object_mut(), "top-level JSON must be an object")?;
 
+    let replace = match get_replace_mode(obj) {
+        Ok(value) => value,
+        Err(_) => REPLACE_DEFAULT_VALUE,
+    };
+
     let env_entries_raw = vec![get_home_env_entry(obj)?];
 
     // Validate env entries and merge as strings
     let env_entries = validate_env_strings(env_entries_raw)?;
     if !env_entries.is_empty() {
-        merge_process_env_strings(obj, env_entries)?;
+        merge_process_env_strings(obj, env_entries, replace)?;
     }
 
     // Pretty-print output JSON with trailing newline
@@ -80,6 +88,51 @@ fn run() -> Result<()> {
         .map_err(|e| Error::new(ExitStatus::IoErr, format!("Failed to flush stdout: {e}")))?;
 
     Ok(())
+}
+
+fn get_replace_mode(obj: &mut Map<String, Value>) -> Result<bool, String> {
+    // Ensure "annotations" exists
+    let annotations_val = obj.entry("annotations".to_string());
+    match annotations_val {
+        Entry::Vacant(_) => return Err(format!("Validation error: 'annotations' doesn't exist.")),
+        Entry::Occupied(_) => {}
+    }
+
+    // Ensure "annotations" is an object
+    let annotations_obj = annotations_val
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            "Validation error: 'annotations' exists but is not an object.".to_string()
+        })?;
+
+    // Check REPLACE_ANNOTATION_NAME entry exists
+    let replace_val = annotations_obj.entry(REPLACE_ANNOTATION_NAME.to_string());
+    match replace_val {
+        Entry::Vacant(_) => {
+            return Err(format!(
+                "Validation error: '{}' doesn't exist.",
+                REPLACE_ANNOTATION_NAME
+            ))
+        }
+        Entry::Occupied(_) => {}
+    }
+
+    let replace: &str = replace_val
+        .or_insert_with(|| json!("false"))
+        .as_str()
+        .ok_or_else(|| {
+            format!(
+                "Validation error: 'annotations.{}' exists but is not a string.",
+                REPLACE_ANNOTATION_NAME
+            )
+        })?;
+
+    match replace {
+        "true" => return Ok(true),
+        "false" => return Ok(false),
+        _ => return Ok(REPLACE_DEFAULT_VALUE),
+    }
 }
 
 // Return the HOME environment entry from the system account database.
@@ -304,8 +357,12 @@ fn validate_kv_format(s: &str) -> Result<()> {
 // 2. we validate out envs
 // 3 new env entries are added using two rules
 // 3.1 we append if the env var is new
-// 3.2 we replace if we find it duplicated
-fn merge_process_env_strings(obj: &mut Map<String, Value>, env_entries: Vec<String>) -> Result<()> {
+// 3.2 we replace if we find it duplicated and replace arg is true
+fn merge_process_env_strings(
+    obj: &mut Map<String, Value>,
+    env_entries: Vec<String>,
+    replace: bool,
+) -> Result<(), String> {
     // Ensure "process" is an object
     let process_val = obj
         .entry("process".to_string())
@@ -330,7 +387,9 @@ fn merge_process_env_strings(obj: &mut Map<String, Value>, env_entries: Vec<Stri
                 .and_then(|s| s.split_once('=').map(|(k, _)| k))
                 .is_some_and(|k| k == new_key)
         }) {
-            env_arr[idx] = Value::String(new);
+            if replace {
+                env_arr[idx] = Value::String(new);
+            }
         } else {
             env_arr.push(Value::String(new));
         }

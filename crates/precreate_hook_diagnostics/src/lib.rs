@@ -51,7 +51,6 @@ pub fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-
 pub fn write_error(hook_name: &str, status: ExitStatus, message: &str) -> io::Result<PathBuf> {
     let uid = effective_uid();
     write_error_in(
@@ -72,12 +71,9 @@ fn log_root_from(runtime_dir: Option<PathBuf>, uid: u32) -> PathBuf {
     let runtime_path = runtime_dir.unwrap_or_default();
     let is_absolute_path = runtime_path.is_absolute();
 
-    let is_valid_runtime_directory =
-        fs::symlink_metadata(&runtime_path).is_ok_and(|metadata| {
-            metadata.is_dir()
-            && !metadata.file_type().is_symlink()
-            && metadata.uid() == uid
-        });
+    let is_valid_runtime_directory = fs::symlink_metadata(&runtime_path).is_ok_and(|metadata| {
+        metadata.is_dir() && !metadata.file_type().is_symlink() && metadata.uid() == uid
+    });
 
     if is_absolute_path && is_valid_runtime_directory {
         runtime_path
