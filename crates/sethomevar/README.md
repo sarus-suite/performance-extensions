@@ -7,7 +7,9 @@ Update container environment replacing HOME variable for running user with the o
 * Reads the **container config JSON** from `stdin` and emits the updated config to `stdout`. 
 * Reads running user uid from container config.
 * Finds the host HOME value through `getent passwd`
-* Replace HOME entry in container config env
+* Add HOME entry in the container config env if missing
+* In its default behavior, Do not replace HOME entry in container config env when already present
+* Setting annotation "com.hooks.sethomevar.override":"true", Replace HOME entry in container config env even if already present
 * Pretty-prints output and exits non-zero on validation/parse errors (errors go to `stderr`). 
 
 ## Usage as a Podman hook
