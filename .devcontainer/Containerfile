@@ -2,7 +2,7 @@ FROM alpine:3.20
 
 # Base build deps
 RUN apk add --no-cache \
-    bash curl git jq ca-certificates \
+    bash curl git jq ca-certificates openssh \
     build-base musl-dev pkgconf \
     openssl-dev openssl-libs-static zlib-dev zlib-static \
     bats
@@ -32,13 +32,13 @@ ARG USER_GID=1000
 
 # Create group and user to help devpod integration on remote ssh provider, force a home for vscode too
 RUN addgroup -g ${USER_GID} ${USERNAME} \
- && adduser -D -h /home/${USERNAME} -s /bin/bash -G ${USERNAME} -u ${USER_UID} ${USERNAME} \
- && mkdir -p /home/${USERNAME} \
- && chown -R ${USER_UID}:${USER_GID} /home/${USERNAME}
+    && adduser -D -h /home/${USERNAME} -s /bin/bash -G ${USERNAME} -u ${USER_UID} ${USERNAME} \
+    && mkdir -p /home/${USERNAME} \
+    && chown -R ${USER_UID}:${USER_GID} /home/${USERNAME}
 
 # Ensure VS Code dirs exist and are owned by your user
 RUN mkdir -p /home/${USERNAME}/.vscode-server/{extensions,data/User} \
- && chown -R ${USER_UID}:${USER_GID} /home/${USERNAME}
+    && chown -R ${USER_UID}:${USER_GID} /home/${USERNAME}
 
 # force HOME is set
 ENV HOME=/home/${USERNAME}

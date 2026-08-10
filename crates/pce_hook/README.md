@@ -86,7 +86,7 @@ Podman currently discards `stderr` from hooks in its non-standard `precreate` st
 mitigation, failures are written both to `stderr` and to:
 
 ```text
-/tmp/precreate-hooks-<effective-uid>/pce_hook.log
+<LOG_ROOT>/precreate-hooks-<effective-uid>/pce_hook.log
 ```
 
 The directory is private to the hook's effective host UID (`0700`), and the append-only log is
@@ -94,10 +94,12 @@ created with mode `0600`. Records contain a UTC timestamp, hook name, UID, PID, 
 category, and escaped error message. They intentionally omit the OCI configuration, environment,
 and complete argument vector.
 
+`<LOG_ROOT>` is `$XDG_RUNTIME_DIR` if available, otherwise the hook falls back on `/tmp`.
+
 For a rootless invocation, inspect the log with:
 
 ```console
-tail -n 20 "/tmp/precreate-hooks-$(id -u)/pce_hook.log"
+tail -n 20 "<LOG_ROOT>/precreate-hooks-$(id -u)/pce_hook.log"
 ```
 
 The file has no application-level rotation and may be removed by normal `/tmp` cleanup. This
