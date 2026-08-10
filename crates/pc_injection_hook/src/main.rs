@@ -1,3 +1,4 @@
+use precreate_hook_diagnostics::{write_error, ExitStatus};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -16,7 +17,12 @@ fn main() {
         Ok(()) => process::exit(0),
         Err(error) => {
             eprintln!("pc_injection_hook: {error}");
-            process::exit(1);
+            if let Err(log_error) =
+                write_error("pc_injection_hook", error.exit_status(), &error.to_string())
+            {
+                eprintln!("pc_injection_hook: failed to write diagnostic log: {log_error}");
+            }
+            process::exit(error.exit_status().code());
         }
     }
 }
@@ -40,20 +46,73 @@ type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 enum Error {
-    Message(String),
-    Io { context: String, source: io::Error },
-    Json(serde_json::Error),
+    Message {
+        status: ExitStatus,
+        message: String,
+    },
+    Io {
+        status: ExitStatus,
+        context: String,
+        source: io::Error,
+    },
+    Json {
+        status: ExitStatus,
+        source: serde_json::Error,
+    },
 }
 
 impl Error {
     fn message(message: impl Into<String>) -> Self {
-        Self::Message(message.into())
+        Self::status_message(ExitStatus::Config, message)
+    }
+
+    fn status_message(status: ExitStatus, message: impl Into<String>) -> Self {
+        Self::Message {
+            status,
+            message: message.into(),
+        }
     }
 
     fn io(context: impl Into<String>, source: io::Error) -> Self {
+        let status = if source.kind() == io::ErrorKind::NotFound {
+            ExitStatus::NoInput
+        } else {
+            ExitStatus::IoErr
+        };
+        Self::status_io(status, context, source)
+    }
+
+    fn status_io(status: ExitStatus, context: impl Into<String>, source: io::Error) -> Self {
         Self::Io {
+            status,
             context: context.into(),
             source,
+        }
+    }
+
+    fn json(status: ExitStatus, source: serde_json::Error) -> Self {
+        Self::Json { status, source }
+    }
+
+    fn exit_status(&self) -> ExitStatus {
+        match self {
+            Self::Message { status, .. } | Self::Io { status, .. } | Self::Json { status, .. } => {
+                *status
+            }
+        }
+    }
+
+    fn with_status(self, status: ExitStatus) -> Self {
+        match self {
+            Self::Message { message, .. } => Self::Message { status, message },
+            Self::Io {
+                context, source, ..
+            } => Self::Io {
+                status,
+                context,
+                source,
+            },
+            Self::Json { source, .. } => Self::Json { status, source },
         }
     }
 }
@@ -61,9 +120,11 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Message(message) => write!(f, "{message}"),
-            Self::Io { context, source } => write!(f, "{context}: {source}"),
-            Self::Json(source) => write!(f, "invalid JSON: {source}"),
+            Self::Message { message, .. } => write!(f, "{message}"),
+            Self::Io {
+                context, source, ..
+            } => write!(f, "{context}: {source}"),
+            Self::Json { source, .. } => write!(f, "invalid JSON: {source}"),
         }
     }
 }
@@ -71,16 +132,16 @@ impl fmt::Display for Error {
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
-            Self::Message(_) => None,
+            Self::Message { .. } => None,
             Self::Io { source, .. } => Some(source),
-            Self::Json(source) => Some(source),
+            Self::Json { source, .. } => Some(source),
         }
     }
 }
 
 impl From<serde_json::Error> for Error {
     fn from(source: serde_json::Error) -> Self {
-        Self::Json(source)
+        Self::json(ExitStatus::Software, source)
     }
 }
 
@@ -171,10 +232,10 @@ struct MountDecision {
 
 fn read_stdin_json_value() -> Result<Value> {
     let mut input = String::new();
-    io::stdin()
-        .read_to_string(&mut input)
-        .map_err(|e| Error::io("failed to read OCI config from stdin", e))?;
-    serde_json::from_str(&input).map_err(Error::from)
+    io::stdin().read_to_string(&mut input).map_err(|e| {
+        Error::status_io(ExitStatus::IoErr, "failed to read OCI config from stdin", e)
+    })?;
+    serde_json::from_str(&input).map_err(|e| Error::json(ExitStatus::DataErr, e))
 }
 
 fn write_stdout_json(value: &Value) -> Result<()> {
@@ -199,7 +260,9 @@ fn load_inputs_from_sources(config: &Value, cli: CliOverrides) -> Result<HookInp
         .and_then(Value::as_object)
         .and_then(|root| root.get("path"))
         .and_then(Value::as_str)
-        .ok_or_else(|| Error::message("OCI config is missing root.path"))?;
+        .ok_or_else(|| {
+            Error::status_message(ExitStatus::DataErr, "OCI config is missing root.path")
+        })?;
 
     let env_ldconfig =
         PathBuf::from(env::var_os("LDCONFIG_PATH").unwrap_or_else(|| "ldconfig".into()));
@@ -236,30 +299,38 @@ where
     let mut overrides = CliOverrides::default();
 
     for arg in args {
-        let arg = arg
-            .into_string()
-            .map_err(|_| Error::message("hook args must contain valid UTF-8"))?;
+        let arg = arg.into_string().map_err(|_| {
+            Error::status_message(ExitStatus::Usage, "hook args must contain valid UTF-8")
+        })?;
 
         if let Some(value) = arg.strip_prefix("--ldconfig=") {
             overrides.ldconfig = Some(PathBuf::from(value));
         } else if let Some(value) = arg.strip_prefix("--lib=") {
-            overrides.primary_libs.push(Library::parse_host(value)?);
+            overrides.primary_libs.push(
+                Library::parse_host(value).map_err(|error| error.with_status(ExitStatus::Usage))?,
+            );
         } else if let Some(value) = arg.strip_prefix("--dependency-lib=") {
-            overrides
-                .dependency_libs
-                .push(Library::parse_host(value)?);
+            overrides.dependency_libs.push(
+                Library::parse_host(value).map_err(|error| error.with_status(ExitStatus::Usage))?,
+            );
         } else if arg == "--allow-unversioned-primary-overwrite" {
             overrides.allow_unversioned_primary_overwrite = true;
         } else if let Some(value) = arg.strip_prefix("--file=") {
             overrides.extra_files.push(PathBuf::from(value));
         } else if let Some(value) = arg.strip_prefix("--env=") {
             let value = value.trim().to_string();
-            validate_kv_format(&value)?;
+            validate_kv_format(&value).map_err(|error| error.with_status(ExitStatus::Usage))?;
             overrides.extra_env.push(value);
         } else if let Some(value) = arg.strip_prefix("--mount=") {
-            overrides.extra_mounts.push(parse_cli_mount_spec(value)?);
+            overrides.extra_mounts.push(
+                parse_cli_mount_spec(value)
+                    .map_err(|error| error.with_status(ExitStatus::Usage))?,
+            );
         } else {
-            return Err(Error::message(format!("unsupported argument: {arg}")));
+            return Err(Error::status_message(
+                ExitStatus::Usage,
+                format!("unsupported argument: {arg}"),
+            ));
         }
     }
 
@@ -272,9 +343,12 @@ fn resolve_rootfs(root_path: &str) -> Result<PathBuf> {
         return Ok(root.to_path_buf());
     }
 
-    Err(Error::message(format!(
-        "pc_injection_hook requires an absolute OCI root.path in precreate mode: {root_path}"
-    )))
+    Err(Error::status_message(
+        ExitStatus::DataErr,
+        format!(
+            "pc_injection_hook requires an absolute OCI root.path in precreate mode: {root_path}"
+        ),
+    ))
 }
 
 fn parse_optional_library_list(var: &'static str) -> Result<Vec<Library>> {
@@ -297,7 +371,11 @@ fn validate_inputs(inputs: &HookInputs) -> Result<()> {
 }
 
 fn prefer_cli_vec<T>(cli: Vec<T>, env: Vec<T>) -> Vec<T> {
-    if cli.is_empty() { env } else { cli }
+    if cli.is_empty() {
+        env
+    } else {
+        cli
+    }
 }
 
 fn parse_optional_path_list(var: &'static str) -> Vec<PathBuf> {
@@ -365,10 +443,8 @@ fn parse_cli_mount_spec(entry: &str) -> Result<ExtraMountEdit> {
         )));
     }
 
-    let source = canonical_mount_source_path(
-        &PathBuf::from(parts[0].trim()),
-        "extra mount source",
-    )?;
+    let source =
+        canonical_mount_source_path(&PathBuf::from(parts[0].trim()), "extra mount source")?;
     let destination = PathBuf::from(parts[1].trim());
     let options = if parts[2].trim().is_empty() {
         Vec::new()
@@ -399,10 +475,8 @@ fn parse_mount_spec_entry(var: &'static str, entry: &str) -> Result<ExtraMountEd
         )));
     }
 
-    let source = canonical_mount_source_path(
-        &PathBuf::from(parts[0].trim()),
-        "extra mount source",
-    )?;
+    let source =
+        canonical_mount_source_path(&PathBuf::from(parts[0].trim()), "extra mount source")?;
     let destination = PathBuf::from(parts[1].trim());
     let mount_type = parts[2].trim();
     let options = if parts[3].trim().is_empty() {
@@ -1029,15 +1103,24 @@ fn list_dynamic_linker_libraries(ldconfig: &Path, rootfs: &Path) -> Result<Vec<P
         .arg(rootfs)
         .arg("-p")
         .output()
-        .map_err(|e| Error::io(format!("failed to execute {}", ldconfig.display()), e))?;
+        .map_err(|e| {
+            Error::status_io(
+                ExitStatus::Unavailable,
+                format!("failed to execute {}", ldconfig.display()),
+                e,
+            )
+        })?;
 
     if !output.status.success() {
-        return Err(Error::message(format!(
-            "{} -r {} -p failed with status {}",
-            ldconfig.display(),
-            rootfs.display(),
-            output.status
-        )));
+        return Err(Error::status_message(
+            ExitStatus::Unavailable,
+            format!(
+                "{} -r {} -p failed with status {}",
+                ldconfig.display(),
+                rootfs.display(),
+                output.status
+            ),
+        ));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1254,9 +1337,12 @@ fn dedupe_paths(paths: &mut Vec<PathBuf>) {
 
 // Now we apply edit to OCI config
 fn apply_config_edits(config: &mut Value, edits: &ConfigEdits) -> Result<()> {
-    let obj = config
-        .as_object_mut()
-        .ok_or_else(|| Error::message("top-level OCI config JSON must be an object"))?;
+    let obj = config.as_object_mut().ok_or_else(|| {
+        Error::status_message(
+            ExitStatus::DataErr,
+            "top-level OCI config JSON must be an object",
+        )
+    })?;
 
     if !edits.mounts.is_empty() {
         append_mounts(obj, &edits.mounts)?;
@@ -1417,9 +1503,12 @@ fn merge_ld_library_path(obj: &mut Map<String, Value>, dirs: &[PathBuf]) -> Resu
     let process_val = obj
         .entry("process".to_string())
         .or_insert_with(|| Value::Object(Map::new()));
-    let process_obj = process_val
-        .as_object_mut()
-        .ok_or_else(|| Error::message("validation error: 'process' exists but is not an object"))?;
+    let process_obj = process_val.as_object_mut().ok_or_else(|| {
+        Error::status_message(
+            ExitStatus::DataErr,
+            "validation error: 'process' exists but is not an object",
+        )
+    })?;
     let env_arr = ensure_array_field(process_obj, "env")?;
 
     // check if we already got an env with LD_LIBRARY_PATH
@@ -1487,9 +1576,12 @@ fn merge_process_env_strings(obj: &mut Map<String, Value>, env_entries: &[String
     let process_val = obj
         .entry("process".to_string())
         .or_insert_with(|| json!({}));
-    let process_obj = process_val
-        .as_object_mut()
-        .ok_or_else(|| Error::message("validation error: 'process' exists but is not an object"))?;
+    let process_obj = process_val.as_object_mut().ok_or_else(|| {
+        Error::status_message(
+            ExitStatus::DataErr,
+            "validation error: 'process' exists but is not an object",
+        )
+    })?;
     let env_arr = ensure_array_field(process_obj, "env")?;
 
     for new in env_entries {
@@ -1527,9 +1619,10 @@ fn ensure_array_field<'a>(
             let value = entry.into_mut();
             match value {
                 Value::Array(arr) => Ok(arr),
-                _ => Err(Error::message(format!(
-                    "validation error: '{field}' exists but is not an array"
-                ))),
+                _ => Err(Error::status_message(
+                    ExitStatus::DataErr,
+                    format!("validation error: '{field}' exists but is not an array"),
+                )),
             }
         }
     }
@@ -1983,9 +2076,33 @@ mod tests {
     #[test]
     fn relative_root_path_is_rejected() {
         let error = resolve_rootfs("rootfs").unwrap_err();
+        assert_eq!(error.exit_status(), ExitStatus::DataErr);
         assert!(error
             .to_string()
             .contains("requires an absolute OCI root.path"));
+    }
+
+    #[test]
+    fn unsupported_cli_argument_is_usage_error() {
+        let error = parse_cli_overrides_from_args(vec!["--unsupported-arg".into()]).unwrap_err();
+        assert_eq!(error.exit_status(), ExitStatus::Usage);
+        assert_eq!(error.to_string(), "unsupported argument: --unsupported-arg");
+    }
+
+    #[test]
+    fn cli_and_environment_validation_use_distinct_categories() {
+        let cli_error = parse_cli_overrides_from_args(vec!["--env=INVALID".into()]).unwrap_err();
+        assert_eq!(cli_error.exit_status(), ExitStatus::Usage);
+
+        let config_error = validate_kv_format("INVALID").unwrap_err();
+        assert_eq!(config_error.exit_status(), ExitStatus::Config);
+    }
+
+    #[test]
+    fn missing_host_source_is_noinput_error() {
+        let missing = unique_temp_path("missing-source");
+        let error = validate_regular_source_file(&missing, "primary library").unwrap_err();
+        assert_eq!(error.exit_status(), ExitStatus::NoInput);
     }
 
     #[test]
@@ -2144,7 +2261,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(overrides.ldconfig, Some(PathBuf::from("/sbin/ldconfig")));
-        assert_eq!(overrides.primary_libs, vec![Library::parse_host(&primary).unwrap()]);
+        assert_eq!(
+            overrides.primary_libs,
+            vec![Library::parse_host(&primary).unwrap()]
+        );
         assert_eq!(
             overrides.dependency_libs,
             vec![Library::parse_host(&dependency).unwrap()]
@@ -2199,10 +2319,7 @@ mod tests {
         std::env::set_var("LDCONFIG_PATH", "/env/ldconfig");
         std::env::set_var("INJECTION_PRIMARY_LIBS", env_primary.as_os_str());
         std::env::set_var("INJECTION_EXTRA_FILES", env_file.as_os_str());
-        std::env::set_var(
-            "INJECTION_EXTRA_ENV",
-            "ENV_ONLY_SHOULD_BE_IGNORED=1",
-        );
+        std::env::set_var("INJECTION_EXTRA_ENV", "ENV_ONLY_SHOULD_BE_IGNORED=1");
         std::env::set_var(
             "INJECTION_EXTRA_MOUNTS",
             format!(
