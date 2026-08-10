@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-const LOG_ROOT: &str = "/tmp";
+const FALLBACK_LOG_ROOT: &str = "/tmp";
 const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 const MAX_ESCAPED_MESSAGE_BYTES: usize = 8 * 1024;
@@ -51,21 +51,39 @@ pub fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-// TODO: this function is currently unused across this workspace, since the hooks call write_error(),
-// which constructs the log path on its own. Does it make sense to keep this around?
-pub fn error_log_path(hook_name: &str) -> PathBuf {
-    error_log_path_in(Path::new(LOG_ROOT), effective_uid(), hook_name)
-}
 
 pub fn write_error(hook_name: &str, status: ExitStatus, message: &str) -> io::Result<PathBuf> {
+    let uid = effective_uid();
     write_error_in(
-        Path::new(LOG_ROOT),
-        effective_uid(),
+        &log_root(uid),
+        uid,
         std::process::id(),
         hook_name,
         status,
         message,
     )
+}
+
+fn log_root(uid: u32) -> PathBuf {
+    log_root_from(std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from), uid)
+}
+
+fn log_root_from(runtime_dir: Option<PathBuf>, uid: u32) -> PathBuf {
+    let runtime_path = runtime_dir.unwrap_or_default();
+    let is_absolute_path = runtime_path.is_absolute();
+
+    let is_valid_runtime_directory =
+        fs::symlink_metadata(&runtime_path).is_ok_and(|metadata| {
+            metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == uid
+        });
+
+    if is_absolute_path && is_valid_runtime_directory {
+        runtime_path
+    } else {
+        PathBuf::from(FALLBACK_LOG_ROOT)
+    }
 }
 
 fn error_log_path_in(root: &Path, uid: u32, hook_name: &str) -> PathBuf {
@@ -240,6 +258,35 @@ mod tests {
             "precreate-hook-diagnostics-test-{label}-{}-{nonce}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn selects_only_a_valid_xdg_runtime_directory() {
+        let uid = effective_uid();
+        let runtime_dir = temp_root("runtime-dir");
+        let symlink_root = temp_root("runtime-dir-symlink");
+        fs::create_dir(&runtime_dir).unwrap();
+        fs::create_dir(&symlink_root).unwrap();
+        let symlink_path = symlink_root.join("runtime-dir");
+        symlink(&runtime_dir, &symlink_path).unwrap();
+
+        // Accept an absolute, real directory owned by the effective user.
+        assert_eq!(log_root_from(Some(runtime_dir.clone()), uid), runtime_dir);
+        // Reject relative paths.
+        assert_eq!(
+            log_root_from(Some(PathBuf::from("relative-runtime-dir")), uid),
+            PathBuf::from(FALLBACK_LOG_ROOT)
+        );
+        // Reject a path that resolves through a symlink.
+        assert_eq!(
+            log_root_from(Some(symlink_path), uid),
+            PathBuf::from(FALLBACK_LOG_ROOT)
+        );
+        // Fall back when XDG_RUNTIME_DIR is unset.
+        assert_eq!(log_root_from(None, uid), PathBuf::from(FALLBACK_LOG_ROOT));
+
+        fs::remove_dir_all(runtime_dir).unwrap();
+        fs::remove_dir_all(symlink_root).unwrap();
     }
 
     #[test]
