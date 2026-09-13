@@ -505,7 +505,11 @@ EOF
   host_src="$workdir/libpciflag-host.c"
   host_lib="$workdir/libpciflag.so"
   hooks_dir="$(mktemp -d)"
-  hook_stderr="$workdir/hook.stderr"
+  hook_log="/tmp/precreate-hooks-$(id -u)/pc_injection_hook.log"
+  hook_log_size=0
+  if [ -f "$hook_log" ]; then
+    hook_log_size="$(wc -c <"$hook_log")"
+  fi
 
   cat >"$host_src" <<'EOF'
 const char *pciflag_marker(void) { return "host-marker"; }
@@ -539,18 +543,17 @@ EOF
 EOF
 
   run podman --hooks-dir="$hooks_dir" run --rm \
-    --runtime=crun \
     --annotation pc-injection.enable=true \
-    --annotation run.oci.hooks.stderr="$hook_stderr" \
     "$IMAGE" true
 
   assert_failure
-  if [ -f "$hook_stderr" ]; then
-    run grep -F "must contain at least a major ABI number" "$hook_stderr"
-    assert_success
-  else
-    assert_output --partial "precreate hook"
-  fi
+  assert_output --partial "exit status 78"
+
+  [ -f "$hook_log" ]
+  run tail -c "+$((hook_log_size + 1))" "$hook_log"
+  assert_success
+  assert_output --partial "status=78 category=EX_CONFIG"
+  assert_output --partial "must contain at least a major ABI number"
 
   rm -rf "$workdir" "$hooks_dir"
 }

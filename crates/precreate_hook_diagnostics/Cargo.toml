@@ -1,0 +1,9 @@
+[package]
+name = "precreate_hook_diagnostics"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+libc = "0.2"

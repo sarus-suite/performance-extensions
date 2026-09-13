@@ -204,7 +204,6 @@ fn get_home_from_etc_passwd(root: &Path, uid: uid_t) -> Result<PathBuf, String> 
 }
 
 fn get_graphroot_from_root(root: &PathBuf) -> Result<PathBuf, String> {
-
     let mut graphroot = root.clone();
     let mut uplevels = 3;
     while uplevels > 0 {

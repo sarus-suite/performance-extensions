@@ -73,34 +73,44 @@ setup() {
   fixture="$repo/test/fixtures/container-config-sample.json"
   fixture_output="$repo/test/fixtures/container-config-sample.json"
   PCE_INPUT="$repo/test/fixtures/pce-input-sample-malformed.json"
+  hook_log="/tmp/precreate-hooks-$(id -u)/pce_hook.log"
+  hook_log_size=0
+  if [ -f "$hook_log" ]; then
+    hook_log_size="$(wc -c <"$hook_log")"
+  fi
 
   run --separate-stderr bash -lc \
     "cat \"$fixture\" | PCE_INPUT=\"$PCE_INPUT\" \"$bin\""
-  [ "$status" -ne 0 ]
-
-#  {
-#    printf '%s\n' "$output"
-#    printf '%s\n' "$stderr"
-#  } >&3
+  [ "$status" -eq 78 ]
 
   # catch the invalid json message
   grep -qi 'invalid json' <<<"$stderr"
+  [ -f "$hook_log" ]
+  run tail -c "+$((hook_log_size + 1))" "$hook_log"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"status=78 category=EX_CONFIG"* ]]
+  [[ "$output" == *"Invalid JSON"* ]]
 }
 
 @test "PCE hook manages invalid type on env" {
   fixture="$repo/test/fixtures/container-config-sample.json"
   fixture_output="$repo/test/fixtures/container-config-sample.json"
   PCE_INPUT="$repo/test/fixtures/pce-input-sample-int-on-env.json"
+  hook_log="/tmp/precreate-hooks-$(id -u)/pce_hook.log"
+  hook_log_size=0
+  if [ -f "$hook_log" ]; then
+    hook_log_size="$(wc -c <"$hook_log")"
+  fi
 
   run --separate-stderr bash -lc \
     "cat \"$fixture\" | PCE_INPUT=\"$PCE_INPUT\" \"$bin\""
-  [ "$status" -ne 0 ]
-
-#  {
-#    printf '%s\n' "$output"
-#    printf '%s\n' "$stderr"
-#  } >&3
+  [ "$status" -eq 78 ]
 
   # catch the invalid type message
   grep -qi 'invalid type' <<<"$stderr"
+  [ -f "$hook_log" ]
+  run tail -c "+$((hook_log_size + 1))" "$hook_log"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"status=78 category=EX_CONFIG"* ]]
+  [[ "$output" == *"invalid type"* ]]
 }

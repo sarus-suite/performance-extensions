@@ -89,3 +89,40 @@ Notes:
 * `INJECTION_EXTRA_ENV` uses semicolon-separated `KEY=VALUE` entries.
 * `INJECTION_EXTRA_MOUNTS` uses `source:destination:type:option1,option2,...`.
 * Only bind-style extra mounts are supported. `type` may be `bind`, `none`, or empty.
+
+## Error diagnostics
+
+Podman currently discards `stderr` from hooks in its non-standard `precreate` stage. As a temporary
+mitigation, failures are written both to `stderr` and to:
+
+```text
+<LOG_ROOT>/precreate-hooks-<effective-uid>/pc_injection_hook.log
+```
+
+The directory is private to the hook's effective host UID (`0700`), and the append-only log is
+created with mode `0600`. Records contain a UTC timestamp, hook name, UID, PID, exit status,
+category, and escaped error message. They intentionally omit the OCI configuration, environment,
+and complete argument vector.
+
+`<LOG_ROOT>` is `$XDG_RUNTIME_DIR` if available, otherwise the hook falls back on `/tmp`.
+
+For a rootless invocation, inspect the log with:
+
+```console
+tail -n 20 "<LOG_ROOT>/precreate-hooks-$(id -u)/pc_injection_hook.log"
+```
+
+The file has no application-level rotation and may be removed by normal `/tmp` cleanup. This
+mechanism is intended only until Podman propagates precreate-hook diagnostics to its caller.
+
+### Exit statuses
+
+| Status | Category | Meaning |
+| ---: | --- | --- |
+| 64 | `EX_USAGE` | Unsupported or malformed CLI argument |
+| 65 | `EX_DATAERR` | Malformed or structurally invalid OCI input |
+| 66 | `EX_NOINPUT` | Configured input, library, or host source is unavailable |
+| 69 | `EX_UNAVAILABLE` | Required external utility failed or is unavailable |
+| 70 | `EX_SOFTWARE` | Unexpected serialization or internal failure |
+| 74 | `EX_IOERR` | Other input, output, staging, or filesystem I/O failure |
+| 78 | `EX_CONFIG` | Semantically invalid hook configuration |
