@@ -1,0 +1,10 @@
+[package]
+name = "ssh_precreate_hook"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+libc = "0.2"
+precreate_hook_diagnostics = { path = "../precreate_hook_diagnostics" }
+serde_json = "1"

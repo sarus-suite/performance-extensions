@@ -2,6 +2,7 @@
 members = [
     "crates/precreate_hook_diagnostics",
     "crates/pce_hook",
+    "crates/ssh_precreate_hook",
     "crates/mps_hook",
     "crates/ldcache_hook",
     "crates/pc_injection_hook",
