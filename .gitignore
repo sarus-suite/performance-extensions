@@ -5,3 +5,4 @@ target
 *.lock
 test/vagrant/ubuntu-24.04/.vagrant/
 test/vagrant/ubuntu-24.04/.cache/
+dist/
