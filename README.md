@@ -24,7 +24,7 @@ Annotation-driven. Fully static binaries. Works on any Linux node.
   updated config to `stdout` during Podman's `precreate` stage.
 
 * *Ephemeral SSH access* [(ssh_precreate_hook)](https://github.com/sarus-suite/performance-extensions/tree/main/crates/ssh_precreate_hook)
-  Creates a per-user SSH identity below `XDG_RUNTIME_DIR` and bind-mounts its derived
+  Creates a per-user SSH identity below `/tmp/sarus-hook-<uid>` and bind-mounts its derived
   `authorized_keys` file into the container during `precreate`.
 
 * *Refresh loader cache* [(ldcache_hook)](https://github.com/sarus-suite/performance-extensions/tree/main/crates/ldcache_hook)
