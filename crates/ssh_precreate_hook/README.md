@@ -2,13 +2,14 @@
 
 `ssh_precreate_hook` prepares per-user SSH access for a container.  At the OCI
 `precreate` stage it reads the OCI configuration from standard input, creates or
-reuses an Ed25519 identity below `$XDG_RUNTIME_DIR/sarus-ssh`, derives its public
-key with host `ssh-keygen`, and bind-mounts the resulting `authorized_keys` file
-at `/etc/ssh/hpc-dev-authorized_keys`.
+reuses an Ed25519 identity below `/tmp/sarus-hook-<effective-uid>`, derives its
+public key with host `ssh-keygen`, and bind-mounts the resulting `authorized_keys`
+file at `/etc/ssh/hpc-dev-authorized_keys`.
 
-The hook writes the modified OCI configuration to standard output.  It needs
+The hook writes the modified OCI configuration to standard output. It needs
 `ssh-keygen` on the host; its state directory and files are restricted to the
-effective user (`0700` and `0600`, respectively).
+effective user (`0700` and `0600`, respectively). No hook environment variables
+are required.
 
 ## OCI hook configuration
 
@@ -30,6 +31,6 @@ The container image must configure `sshd` to use
 ## Failure behavior
 
 The hook deliberately fails rather than rotating a key or waiting on another
-precreate invocation. A stale `$XDG_RUNTIME_DIR/sarus-ssh/.lock` must be removed
-by the owner before retrying. Errors are also recorded through the shared
+precreate invocation. A stale `/tmp/sarus-hook-<effective-uid>/.lock` must be
+removed by the owner before retrying. Errors are also recorded through the shared
 precreate diagnostics facility.

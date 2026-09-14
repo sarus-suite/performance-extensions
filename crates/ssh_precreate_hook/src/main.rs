@@ -1,5 +1,5 @@
 use std::{
-    env, fmt, fs,
+    fmt, fs,
     io::{self, Read, Seek, SeekFrom, Write},
     os::unix::{
         fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -13,7 +13,7 @@ use std::{
 use precreate_hook_diagnostics::{write_error, ExitStatus};
 use serde_json::{json, Map, Value};
 
-const STATE_DIR_NAME: &str = "sarus-ssh";
+const STATE_DIR_PREFIX: &str = "sarus-hook-";
 const AUTHORIZED_KEYS_NAME: &str = "authorized_keys";
 const IDENTITY_NAME: &str = "identity";
 const DESTINATION: &str = "/etc/ssh/hpc-dev-authorized_keys";
@@ -117,18 +117,7 @@ fn write_stdout_json(value: &Value) -> Result<()> {
 }
 
 fn state_directory() -> Result<PathBuf> {
-    let runtime = env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::Config,
-                "XDG_RUNTIME_DIR must be an absolute path",
-            )
-        })?;
-    validate_directory(&runtime, "XDG_RUNTIME_DIR")?;
-
-    let state = runtime.join(STATE_DIR_NAME);
+    let state = state_directory_path();
     match fs::create_dir(&state) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -150,6 +139,10 @@ fn state_directory() -> Result<PathBuf> {
         )
     })?;
     Ok(state)
+}
+
+fn state_directory_path() -> PathBuf {
+    PathBuf::from("/tmp").join(format!("{STATE_DIR_PREFIX}{}", effective_uid()))
 }
 
 fn validate_directory(path: &Path, label: &str) -> Result<()> {
@@ -510,5 +503,13 @@ mod tests {
             "mounts": [{"destination": DESTINATION, "type": "bind", "source": "/other"}],
         });
         assert!(add_authorized_keys_mount(config.as_object_mut().unwrap(), source).is_err());
+    }
+
+    #[test]
+    fn uses_a_per_uid_tmp_state_directory() {
+        assert_eq!(
+            state_directory_path(),
+            PathBuf::from(format!("/tmp/{STATE_DIR_PREFIX}{}", effective_uid()))
+        );
     }
 }
