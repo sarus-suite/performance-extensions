@@ -117,7 +117,7 @@ fn write_stdout_json(value: &Value) -> Result<()> {
 }
 
 fn state_directory() -> Result<PathBuf> {
-    let state = state_directory_path();
+    let state = state_directory_path()?;
     match fs::create_dir(&state) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -141,8 +141,84 @@ fn state_directory() -> Result<PathBuf> {
     Ok(state)
 }
 
-fn state_directory_path() -> PathBuf {
-    PathBuf::from("/tmp").join(format!("{STATE_DIR_PREFIX}{}", effective_uid()))
+fn state_directory_path() -> Result<PathBuf> {
+    Ok(state_directory_path_for_uid(state_owner_uid()?))
+}
+
+fn state_directory_path_for_uid(uid: u32) -> PathBuf {
+    PathBuf::from("/tmp").join(format!("{STATE_DIR_PREFIX}{uid}"))
+}
+
+fn state_owner_uid() -> Result<u32> {
+    let uid = effective_uid();
+    if uid == 0 {
+        host_uid_from_map(
+            uid,
+            &fs::read_to_string("/proc/self/uid_map").map_err(|error| {
+                Error::new(
+                    ExitStatus::Config,
+                    format!("failed to read /proc/self/uid_map: {error}"),
+                )
+            })?,
+        )
+    } else {
+        Ok(uid)
+    }
+}
+
+fn host_uid_from_map(namespace_uid: u32, map: &str) -> Result<u32> {
+    let namespace_uid = u64::from(namespace_uid);
+
+    for line in map.lines().filter(|line| !line.trim().is_empty()) {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 3 {
+            return Err(Error::new(
+                ExitStatus::Config,
+                format!("invalid /proc/self/uid_map line: {line:?}"),
+            ));
+        }
+        let inside = fields[0].parse::<u64>().map_err(|error| {
+            Error::new(
+                ExitStatus::Config,
+                format!("invalid namespace UID in /proc/self/uid_map: {error}"),
+            )
+        })?;
+        let outside = fields[1].parse::<u64>().map_err(|error| {
+            Error::new(
+                ExitStatus::Config,
+                format!("invalid host UID in /proc/self/uid_map: {error}"),
+            )
+        })?;
+        let length = fields[2].parse::<u64>().map_err(|error| {
+            Error::new(
+                ExitStatus::Config,
+                format!("invalid UID range in /proc/self/uid_map: {error}"),
+            )
+        })?;
+        let end = inside.checked_add(length).ok_or_else(|| {
+            Error::new(
+                ExitStatus::Config,
+                "UID range overflows in /proc/self/uid_map",
+            )
+        })?;
+
+        if namespace_uid >= inside && namespace_uid < end {
+            let host_uid = outside.checked_add(namespace_uid - inside).ok_or_else(|| {
+                Error::new(
+                    ExitStatus::Config,
+                    "host UID overflows in /proc/self/uid_map",
+                )
+            })?;
+            return u32::try_from(host_uid).map_err(|_| {
+                Error::new(ExitStatus::Config, "mapped host UID does not fit in u32")
+            });
+        }
+    }
+
+    Err(Error::new(
+        ExitStatus::Config,
+        format!("UID {namespace_uid} is not mapped in /proc/self/uid_map"),
+    ))
 }
 
 fn validate_directory(path: &Path, label: &str) -> Result<()> {
@@ -508,8 +584,21 @@ mod tests {
     #[test]
     fn uses_a_per_uid_tmp_state_directory() {
         assert_eq!(
-            state_directory_path(),
-            PathBuf::from(format!("/tmp/{STATE_DIR_PREFIX}{}", effective_uid()))
+            state_directory_path_for_uid(23_961),
+            PathBuf::from("/tmp/sarus-hook-23961")
         );
+    }
+
+    #[test]
+    fn maps_namespace_root_to_its_host_uid() {
+        assert_eq!(
+            host_uid_from_map(0, "0 23961 1\n1 100000 65536\n").unwrap(),
+            23_961
+        );
+    }
+
+    #[test]
+    fn maps_a_uid_inside_a_larger_range() {
+        assert_eq!(host_uid_from_map(42, "0 100000 65536\n").unwrap(), 100_042);
     }
 }
