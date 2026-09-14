@@ -58,6 +58,7 @@ jobs:
               mkdir -p dist/hooks-${{ matrix.arch }}
               cp target/release/ldcache_hook "dist/hooks-${{ matrix.arch }}/ldcache_hook"
               cp target/release/pce_hook "dist/hooks-${{ matrix.arch }}/pce_hook"
+              cp target/release/ssh_precreate_hook "dist/hooks-${{ matrix.arch }}/ssh_precreate_hook"
               cp target/release/mps_hook "dist/hooks-${{ matrix.arch }}/mps_hook"
               cp target/release/sethomevar "dist/hooks-${{ matrix.arch }}/sethomevar"
               cp target/release/mkhomedir "dist/hooks-${{ matrix.arch }}/mkhomedir"
