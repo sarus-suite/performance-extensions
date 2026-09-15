@@ -1,0 +1,33 @@
+#!/bin/sh
+
+# Optional SSH experiment; never invoked during container startup.
+
+set -eu
+fail() { echo "hpc-dev-sshd: $*" >&2; exit 1; }
+[ "$(id -u)" -ne 0 ] || fail "run as the user supplied by Sarus/Podman"
+user=$(id -un)
+case "$user" in ''|*[!a-zA-Z0-9_.-]*) fail "unsupported account name" ;; esac
+: "${HOME:?runtime must supply HOME}"
+state=${HPC_DEV_SSH_DIR:-$HOME/.local/state/hpc-dev/ssh}
+case "$state" in /*) ;; *) fail "HPC_DEV_SSH_DIR must be an absolute path" ;; esac
+key=$state/ssh_host_ed25519_key
+case "${1:-}" in
+--prepare)
+    [ "$#" -eq 1 ] || fail "usage: hpc-dev-sshd [--prepare]"
+    umask 077
+    mkdir -p "$state"
+    [ -O "$state" ] || fail "SSH state directory must belong to the current user"
+    chmod 0700 "$state"
+    if [ ! -f "$key" ]; then
+        ssh-keygen -q -t ed25519 -N '' -f "$key"
+    fi
+    # This may fail on the target OpenSSH build. Leave the account untouched.
+    exec /usr/sbin/sshd -t -f /etc/ssh/sshd_config.podman \
+        -h "$key" -o "AllowUsers=$user" -o "PidFile=$state/sshd.pid"
+    ;;
+'') [ "$#" -eq 0 ] || fail "usage: hpc-dev-sshd [--prepare]" ;;
+*) fail "usage: hpc-dev-sshd [--prepare]" ;;
+esac
+[ -r "$key" ] || fail "run hpc-dev-sshd --prepare inside the container first"
+exec /usr/sbin/sshd -i -e -f /etc/ssh/sshd_config.podman \
+    -h "$key" -o "AllowUsers=$user" -o "PidFile=$state/sshd.pid"
