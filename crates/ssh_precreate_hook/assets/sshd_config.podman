@@ -6,6 +6,7 @@
 # account provided by Sarus. No account or password files are modified.
 
 PermitRootLogin no
+LogLevel ERROR
 UsePAM no
 KbdInteractiveAuthentication no
 PermitTTY yes
