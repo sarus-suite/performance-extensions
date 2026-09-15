@@ -11,9 +11,8 @@ case "$user" in ''|*[!a-zA-Z0-9_.-]*) fail "unsupported account name" ;; esac
 state=${HPC_DEV_SSH_DIR:-$HOME/.local/state/hpc-dev/ssh}
 case "$state" in /*) ;; *) fail "HPC_DEV_SSH_DIR must be an absolute path" ;; esac
 key=$state/ssh_host_ed25519_key
-case "${1:-}" in
---prepare)
-    [ "$#" -eq 1 ] || fail "usage: hpc-dev-sshd [--prepare]"
+
+prepare() {
     umask 077
     mkdir -p "$state"
     [ -O "$state" ] || fail "SSH state directory must belong to the current user"
@@ -22,12 +21,19 @@ case "${1:-}" in
         ssh-keygen -q -t ed25519 -N '' -f "$key"
     fi
     # This may fail on the target OpenSSH build. Leave the account untouched.
-    exec /usr/sbin/sshd -t -f /etc/ssh/sshd_config.podman \
+    /usr/sbin/sshd -t -f /etc/ssh/sshd_config.podman \
         -h "$key" -o "AllowUsers=$user" -o "PidFile=$state/sshd.pid"
+}
+
+case "${1:-}" in
+--prepare)
+    [ "$#" -eq 1 ] || fail "usage: hpc-dev-sshd [--prepare]"
+    prepare
+    exit 0
     ;;
 '') [ "$#" -eq 0 ] || fail "usage: hpc-dev-sshd [--prepare]" ;;
 *) fail "usage: hpc-dev-sshd [--prepare]" ;;
 esac
-[ -r "$key" ] || fail "run hpc-dev-sshd --prepare inside the container first"
+prepare
 exec /usr/sbin/sshd -i -e -f /etc/ssh/sshd_config.podman \
     -h "$key" -o "AllowUsers=$user" -o "PidFile=$state/sshd.pid"
