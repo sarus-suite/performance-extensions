@@ -8,3 +8,4 @@ publish = false
 libc = "0.2"
 precreate_hook_diagnostics = { path = "../precreate_hook_diagnostics" }
 serde_json = "1"
+sha2 = "0.10"

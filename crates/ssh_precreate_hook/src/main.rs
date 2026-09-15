@@ -12,6 +12,7 @@ use std::{
 
 use precreate_hook_diagnostics::{write_error, ExitStatus};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 
 const STATE_DIR_PREFIX: &str = "sarus-hook-";
 const AUTHORIZED_KEYS_NAME: &str = "authorized_keys";
@@ -19,6 +20,7 @@ const IDENTITY_NAME: &str = "identity";
 const DESTINATION: &str = "/etc/ssh/hpc-dev-authorized_keys";
 const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
+const AUTHORIZED_KEY_ANNOTATION: &str = "ssh.authorized_key";
 
 fn main() {
     if let Err(error) = run() {
@@ -74,9 +76,15 @@ fn run() -> Result<()> {
 
     let state = state_directory()?;
     let _lock = Lock::acquire(&state)?;
-    let identity = ensure_identity(&state)?;
-    let authorized_keys = state.join(AUTHORIZED_KEYS_NAME);
-    write_authorized_keys(&identity, &authorized_keys)?;
+    let authorized_keys = match annotation_authorized_key(config_object)? {
+        Some(key) => write_annotated_authorized_key(&state, &key)?,
+        None => {
+            let identity = ensure_identity(&state)?;
+            let authorized_keys = state.join(AUTHORIZED_KEYS_NAME);
+            write_authorized_keys(&identity, &authorized_keys)?;
+            authorized_keys
+        }
+    };
     add_authorized_keys_mount(config_object, &authorized_keys)?;
     write_stdout_json(&config)
 }
@@ -330,7 +338,6 @@ fn generate_identity(state: &Path, identity: &Path) -> Result<()> {
 }
 
 fn write_authorized_keys(identity: &Path, authorized_keys: &Path) -> Result<()> {
-    validate_not_symlink(authorized_keys, "authorized_keys")?;
     let output = Command::new("ssh-keygen")
         .args(["-y", "-P", "", "-f"])
         .arg(identity)
@@ -355,6 +362,94 @@ fn write_authorized_keys(identity: &Path, authorized_keys: &Path) -> Result<()> 
             ),
         ));
     }
+
+    write_authorized_keys_file(authorized_keys, &output.stdout)
+}
+
+fn annotation_authorized_key(config: &Map<String, Value>) -> Result<Option<String>> {
+    let Some(annotations) = config.get("annotations") else {
+        return Ok(None);
+    };
+    let annotations = annotations.as_object().ok_or_else(|| {
+        Error::new(
+            ExitStatus::DataErr,
+            "OCI configuration annotations must be an object",
+        )
+    })?;
+    let Some(key) = annotations.get(AUTHORIZED_KEY_ANNOTATION) else {
+        return Ok(None);
+    };
+    let key = key.as_str().ok_or_else(|| {
+        Error::new(
+            ExitStatus::Config,
+            format!("{AUTHORIZED_KEY_ANNOTATION} must be a string"),
+        )
+    })?;
+    if key.contains(['\n', '\r', '\0']) {
+        return Err(Error::new(
+            ExitStatus::Config,
+            format!("{AUTHORIZED_KEY_ANNOTATION} must contain exactly one public key"),
+        ));
+    }
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(Error::new(
+            ExitStatus::Config,
+            format!("{AUTHORIZED_KEY_ANNOTATION} must not be empty"),
+        ));
+    }
+    Ok(Some(key.to_owned()))
+}
+
+fn write_annotated_authorized_key(state: &Path, key: &str) -> Result<PathBuf> {
+    validate_annotated_public_key(state, key)?;
+    let digest = Sha256::digest(key.as_bytes());
+    let name = format!("{AUTHORIZED_KEYS_NAME}.{:x}", digest);
+    let path = state.join(name);
+    write_authorized_keys_file(&path, key.as_bytes())?;
+    Ok(path)
+}
+
+fn validate_annotated_public_key(state: &Path, key: &str) -> Result<()> {
+    let path = state.join(format!(".validate-key-{}-{}", process::id(), nonce()?));
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(FILE_MODE)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&path)
+        .and_then(|mut file| file.write_all(key.as_bytes()))
+        .map_err(|error| {
+            Error::new(
+                ExitStatus::IoErr,
+                format!("failed to stage {AUTHORIZED_KEY_ANNOTATION}: {error}"),
+            )
+        })?;
+
+    let result = Command::new("ssh-keygen")
+        .args(["-l", "-f"])
+        .arg(&path)
+        .output();
+    let _ = fs::remove_file(&path);
+    match result {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(_) => Err(Error::new(
+            ExitStatus::Config,
+            format!("{AUTHORIZED_KEY_ANNOTATION} is not a valid OpenSSH public key"),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(Error::new(
+            ExitStatus::Unavailable,
+            "ssh-keygen is required on the host",
+        )),
+        Err(error) => Err(Error::new(
+            ExitStatus::IoErr,
+            format!("failed to execute ssh-keygen: {error}"),
+        )),
+    }
+}
+
+fn write_authorized_keys_file(authorized_keys: &Path, contents: &[u8]) -> Result<()> {
+    validate_not_symlink(authorized_keys, "authorized_keys")?;
 
     let mut file = fs::OpenOptions::new()
         .create(true)
@@ -384,13 +479,13 @@ fn write_authorized_keys(identity: &Path, authorized_keys: &Path) -> Result<()> 
             format!("failed to seek authorized_keys: {error}"),
         )
     })?;
-    file.write_all(&output.stdout).map_err(|error| {
+    file.write_all(contents).map_err(|error| {
         Error::new(
             ExitStatus::IoErr,
             format!("failed to write authorized_keys: {error}"),
         )
     })?;
-    if !output.stdout.ends_with(b"\n") {
+    if !contents.ends_with(b"\n") {
         file.write_all(b"\n").map_err(|error| {
             Error::new(
                 ExitStatus::IoErr,
@@ -600,5 +695,26 @@ mod tests {
     #[test]
     fn maps_a_uid_inside_a_larger_range() {
         assert_eq!(host_uid_from_map(42, "0 100000 65536\n").unwrap(), 100_042);
+    }
+
+    #[test]
+    fn reads_a_single_authorized_key_annotation() {
+        let config = json!({
+            "annotations": {
+                AUTHORIZED_KEY_ANNOTATION: " ssh-ed25519 AAAA example "
+            }
+        });
+        assert_eq!(
+            annotation_authorized_key(config.as_object().unwrap()).unwrap(),
+            Some("ssh-ed25519 AAAA example".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_multiline_authorized_key_annotation() {
+        let config = json!({
+            "annotations": { AUTHORIZED_KEY_ANNOTATION: "key-one\nkey-two" }
+        });
+        assert!(annotation_authorized_key(config.as_object().unwrap()).is_err());
     }
 }
