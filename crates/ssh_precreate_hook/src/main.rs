@@ -18,9 +18,17 @@ const STATE_DIR_PREFIX: &str = "sarus-hook-";
 const AUTHORIZED_KEYS_NAME: &str = "authorized_keys";
 const IDENTITY_NAME: &str = "identity";
 const DESTINATION: &str = "/etc/ssh/hpc-dev-authorized_keys";
+const SSHD_CONFIG_NAME: &str = "sshd_config.podman";
+const SSHD_CONFIG_DESTINATION: &str = "/etc/ssh/sshd_config.podman";
+const SSHD_LAUNCHER_NAME: &str = "hpc-dev-sshd";
+const SSHD_LAUNCHER_DESTINATION: &str = "/usr/local/bin/hpc-dev-sshd";
 const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
+const CONFIG_MODE: u32 = 0o644;
+const EXECUTABLE_MODE: u32 = 0o755;
 const AUTHORIZED_KEY_ANNOTATION: &str = "ssh.authorized_key";
+const SSHD_CONFIG: &[u8] = include_bytes!("../assets/sshd_config.podman");
+const SSHD_LAUNCHER: &[u8] = include_bytes!("../assets/hpc-dev-sshd");
 
 fn main() {
     if let Err(error) = run() {
@@ -85,7 +93,13 @@ fn run() -> Result<()> {
             authorized_keys
         }
     };
-    add_authorized_keys_mount(config_object, &authorized_keys)?;
+    let (sshd_config, sshd_launcher) = ensure_sshd_assets(&state)?;
+    add_ssh_mounts(
+        config_object,
+        &authorized_keys,
+        &sshd_config,
+        &sshd_launcher,
+    )?;
     write_stdout_json(&config)
 }
 
@@ -448,56 +462,89 @@ fn validate_annotated_public_key(state: &Path, key: &str) -> Result<()> {
     }
 }
 
-fn write_authorized_keys_file(authorized_keys: &Path, contents: &[u8]) -> Result<()> {
-    validate_not_symlink(authorized_keys, "authorized_keys")?;
+fn ensure_sshd_assets(state: &Path) -> Result<(PathBuf, PathBuf)> {
+    let config = state.join(SSHD_CONFIG_NAME);
+    write_state_file(
+        &config,
+        SSHD_CONFIG,
+        CONFIG_MODE,
+        "sshd configuration",
+        false,
+    )?;
 
+    let launcher = state.join(SSHD_LAUNCHER_NAME);
+    write_state_file(
+        &launcher,
+        SSHD_LAUNCHER,
+        EXECUTABLE_MODE,
+        "sshd launcher",
+        false,
+    )?;
+    Ok((config, launcher))
+}
+
+fn write_authorized_keys_file(authorized_keys: &Path, contents: &[u8]) -> Result<()> {
+    write_state_file(
+        authorized_keys,
+        contents,
+        FILE_MODE,
+        "authorized_keys",
+        true,
+    )
+}
+
+fn write_state_file(
+    path: &Path,
+    contents: &[u8],
+    mode: u32,
+    label: &str,
+    append_newline: bool,
+) -> Result<()> {
+    validate_not_symlink(path, label)?;
     let mut file = fs::OpenOptions::new()
         .create(true)
         .write(true)
-        .mode(FILE_MODE)
+        .mode(mode)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(authorized_keys)
+        .open(path)
         .map_err(|error| {
             Error::new(
                 ExitStatus::IoErr,
-                format!(
-                    "failed to open authorized_keys {}: {error}",
-                    authorized_keys.display()
-                ),
+                format!("failed to open {label} {}: {error}", path.display()),
             )
         })?;
-    validate_open_file(&file, authorized_keys, "authorized_keys")?;
+    validate_open_file(&file, path, label)?;
     file.set_len(0).map_err(|error| {
         Error::new(
             ExitStatus::IoErr,
-            format!("failed to truncate authorized_keys: {error}"),
+            format!("failed to truncate {label}: {error}"),
         )
     })?;
     file.seek(SeekFrom::Start(0)).map_err(|error| {
         Error::new(
             ExitStatus::IoErr,
-            format!("failed to seek authorized_keys: {error}"),
+            format!("failed to seek {label}: {error}"),
         )
     })?;
     file.write_all(contents).map_err(|error| {
         Error::new(
             ExitStatus::IoErr,
-            format!("failed to write authorized_keys: {error}"),
+            format!("failed to write {label}: {error}"),
         )
     })?;
-    if !contents.ends_with(b"\n") {
+    if append_newline && !contents.ends_with(b"\n") {
         file.write_all(b"\n").map_err(|error| {
             Error::new(
                 ExitStatus::IoErr,
-                format!("failed to finish authorized_keys: {error}"),
+                format!("failed to finish {label}: {error}"),
             )
         })?;
     }
-    file.set_permissions(fs::Permissions::from_mode(FILE_MODE))
+    file.set_permissions(fs::Permissions::from_mode(mode))
         .map_err(|error| {
             Error::new(
                 ExitStatus::IoErr,
-                format!("failed to protect authorized_keys: {error}"),
+                format!("failed to protect {label}: {error}"),
             )
         })
 }
@@ -551,16 +598,45 @@ fn validate_open_file(file: &fs::File, path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn add_authorized_keys_mount(config: &mut Map<String, Value>, source: &Path) -> Result<()> {
+struct MountSpec<'a> {
+    source: &'a Path,
+    destination: &'static str,
+    options: &'static [&'static str],
+}
+
+fn add_ssh_mounts(
+    config: &mut Map<String, Value>,
+    authorized_keys: &Path,
+    sshd_config: &Path,
+    sshd_launcher: &Path,
+) -> Result<()> {
+    let specs = [
+        MountSpec {
+            source: authorized_keys,
+            destination: DESTINATION,
+            options: &["bind", "ro", "nosuid", "nodev", "noexec"],
+        },
+        MountSpec {
+            source: sshd_config,
+            destination: SSHD_CONFIG_DESTINATION,
+            options: &["bind", "ro", "nosuid", "nodev", "noexec"],
+        },
+        MountSpec {
+            source: sshd_launcher,
+            destination: SSHD_LAUNCHER_DESTINATION,
+            options: &["bind", "ro", "nosuid", "nodev"],
+        },
+    ];
+    add_mounts(config, &specs)
+}
+
+fn add_mounts(config: &mut Map<String, Value>, specs: &[MountSpec<'_>]) -> Result<()> {
     if !config.get("process").is_some_and(Value::is_object) {
         return Err(Error::new(
             ExitStatus::DataErr,
             "OCI configuration must contain a process object",
         ));
     }
-    let source = source
-        .to_str()
-        .ok_or_else(|| Error::new(ExitStatus::Config, "SSH state path must be valid UTF-8"))?;
     let mounts_value = match config.entry("mounts".to_owned()) {
         serde_json::map::Entry::Vacant(entry) => entry.insert(Value::Array(Vec::new())),
         serde_json::map::Entry::Occupied(entry) => {
@@ -578,15 +654,21 @@ fn add_authorized_keys_mount(config: &mut Map<String, Value>, source: &Path) -> 
         )
     })?;
 
-    for mount in mounts.iter().filter_map(Value::as_object) {
-        if mount.get("destination").and_then(Value::as_str) == Some(DESTINATION)
-            && !(mount.get("source").and_then(Value::as_str) == Some(source)
-                && mount.get("type").and_then(Value::as_str) == Some("bind"))
-        {
-            return Err(Error::new(
-                ExitStatus::Config,
-                format!("conflicting mount already owns {DESTINATION}"),
-            ));
+    for spec in specs {
+        let source = spec
+            .source
+            .to_str()
+            .ok_or_else(|| Error::new(ExitStatus::Config, "SSH state path must be valid UTF-8"))?;
+        for mount in mounts.iter().filter_map(Value::as_object) {
+            if mount.get("destination").and_then(Value::as_str) == Some(spec.destination)
+                && !(mount.get("source").and_then(Value::as_str) == Some(source)
+                    && mount.get("type").and_then(Value::as_str) == Some("bind"))
+            {
+                return Err(Error::new(
+                    ExitStatus::Config,
+                    format!("conflicting mount already owns {}", spec.destination),
+                ));
+            }
         }
     }
     mounts.retain(|mount| {
@@ -594,14 +676,19 @@ fn add_authorized_keys_mount(config: &mut Map<String, Value>, source: &Path) -> 
             .as_object()
             .and_then(|mount| mount.get("destination"))
             .and_then(Value::as_str)
-            != Some(DESTINATION)
+            .map_or(true, |destination| {
+                !specs.iter().any(|spec| spec.destination == destination)
+            })
     });
-    mounts.push(json!({
-        "destination": DESTINATION,
-        "type": "bind",
-        "source": source,
-        "options": ["bind", "ro", "nosuid", "nodev", "noexec"],
-    }));
+    for spec in specs {
+        let source = spec.source.to_str().expect("validated above");
+        mounts.push(json!({
+            "destination": spec.destination,
+            "type": "bind",
+            "source": source,
+            "options": spec.options,
+        }));
+    }
     Ok(())
 }
 
@@ -657,7 +744,15 @@ mod tests {
             "process": {},
             "mounts": [{"destination": DESTINATION, "type": "bind", "source": source}],
         });
-        add_authorized_keys_mount(config.as_object_mut().unwrap(), source).unwrap();
+        add_mounts(
+            config.as_object_mut().unwrap(),
+            &[MountSpec {
+                source,
+                destination: DESTINATION,
+                options: &["bind", "ro", "nosuid", "nodev", "noexec"],
+            }],
+        )
+        .unwrap();
         let mounts = config["mounts"].as_array().unwrap();
         assert_eq!(mounts.len(), 1);
         assert_eq!(
@@ -673,7 +768,15 @@ mod tests {
             "process": {},
             "mounts": [{"destination": DESTINATION, "type": "bind", "source": "/other"}],
         });
-        assert!(add_authorized_keys_mount(config.as_object_mut().unwrap(), source).is_err());
+        assert!(add_mounts(
+            config.as_object_mut().unwrap(),
+            &[MountSpec {
+                source,
+                destination: DESTINATION,
+                options: &["bind", "ro", "nosuid", "nodev", "noexec"],
+            }],
+        )
+        .is_err());
     }
 
     #[test]
@@ -716,5 +819,32 @@ mod tests {
             "annotations": { AUTHORIZED_KEY_ANNOTATION: "key-one\nkey-two" }
         });
         assert!(annotation_authorized_key(config.as_object().unwrap()).is_err());
+    }
+
+    #[test]
+    fn adds_executable_sshd_launcher_mount() {
+        let authorized_keys = Path::new("/tmp/sarus-hook-23961/authorized_keys");
+        let sshd_config = Path::new("/tmp/sarus-hook-23961/sshd_config.podman");
+        let sshd_launcher = Path::new("/tmp/sarus-hook-23961/hpc-dev-sshd");
+        let mut config = json!({ "process": {}, "mounts": [] });
+
+        add_ssh_mounts(
+            config.as_object_mut().unwrap(),
+            authorized_keys,
+            sshd_config,
+            sshd_launcher,
+        )
+        .unwrap();
+
+        let launcher = config["mounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|mount| mount["destination"] == SSHD_LAUNCHER_DESTINATION)
+            .unwrap();
+        assert_eq!(
+            launcher["options"],
+            json!(["bind", "ro", "nosuid", "nodev"])
+        );
     }
 }
