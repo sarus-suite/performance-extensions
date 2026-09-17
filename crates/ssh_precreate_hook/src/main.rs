@@ -22,13 +22,21 @@ const SSHD_CONFIG_NAME: &str = "sshd_config.podman";
 const SSHD_CONFIG_DESTINATION: &str = "/etc/ssh/sshd_config.podman";
 const SSHD_LAUNCHER_NAME: &str = "hpc-dev-sshd";
 const SSHD_LAUNCHER_DESTINATION: &str = "/usr/local/bin/hpc-dev-sshd";
+const SSHD_BUNDLE_PREFIX: &str = "hpc-sshd";
+const SSHD_BUNDLE_DESTINATION: &str = "/usr/local/libexec/hpc-sshd";
 const DIRECTORY_MODE: u32 = 0o700;
+const BUNDLE_DIRECTORY_MODE: u32 = 0o755;
 const FILE_MODE: u32 = 0o600;
 const CONFIG_MODE: u32 = 0o644;
 const EXECUTABLE_MODE: u32 = 0o755;
 const AUTHORIZED_KEY_ANNOTATION: &str = "ssh.authorized_key";
 const SSHD_CONFIG: &[u8] = include_bytes!("../assets/sshd_config.podman");
 const SSHD_LAUNCHER: &[u8] = include_bytes!("../assets/hpc-dev-sshd");
+const SSHD_BUNDLE: [(&str, &[u8]); 3] = [
+    ("sshd", include_bytes!("../assets/sshd")),
+    ("sshd-auth", include_bytes!("../assets/sshd-auth")),
+    ("sshd-session", include_bytes!("../assets/sshd-session")),
+];
 
 fn main() {
     if let Err(error) = run() {
@@ -93,12 +101,13 @@ fn run() -> Result<()> {
             authorized_keys
         }
     };
-    let (sshd_config, sshd_launcher) = ensure_sshd_assets(&state)?;
+    let (sshd_config, sshd_launcher, sshd_bundle) = ensure_sshd_assets(&state)?;
     add_ssh_mounts(
         config_object,
         &authorized_keys,
         &sshd_config,
         &sshd_launcher,
+        &sshd_bundle,
     )?;
     write_stdout_json(&config)
 }
@@ -462,7 +471,7 @@ fn validate_annotated_public_key(state: &Path, key: &str) -> Result<()> {
     }
 }
 
-fn ensure_sshd_assets(state: &Path) -> Result<(PathBuf, PathBuf)> {
+fn ensure_sshd_assets(state: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let config = state.join(SSHD_CONFIG_NAME);
     write_state_file(
         &config,
@@ -480,7 +489,144 @@ fn ensure_sshd_assets(state: &Path) -> Result<(PathBuf, PathBuf)> {
         "sshd launcher",
         false,
     )?;
-    Ok((config, launcher))
+    let bundle = ensure_sshd_bundle(state)?;
+    Ok((config, launcher, bundle))
+}
+
+fn ensure_sshd_bundle(state: &Path) -> Result<PathBuf> {
+    let bundle = state.join(sshd_bundle_name());
+    match fs::symlink_metadata(&bundle) {
+        Ok(_) => {
+            validate_directory(&bundle, "sshd bundle")?;
+            validate_sshd_bundle(&bundle)?;
+            return Ok(bundle);
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(Error::new(
+                ExitStatus::IoErr,
+                format!(
+                    "failed to inspect sshd bundle {}: {error}",
+                    bundle.display()
+                ),
+            ));
+        }
+    }
+
+    let work = state.join(format!(".prepare-sshd-{}-{}", process::id(), nonce()?));
+    fs::create_dir(&work).map_err(|error| {
+        Error::new(
+            ExitStatus::IoErr,
+            format!("failed to create sshd bundle directory: {error}"),
+        )
+    })?;
+    fs::set_permissions(&work, fs::Permissions::from_mode(BUNDLE_DIRECTORY_MODE)).map_err(
+        |error| {
+            let _ = fs::remove_dir_all(&work);
+            Error::new(
+                ExitStatus::IoErr,
+                format!("failed to set sshd bundle directory permissions: {error}"),
+            )
+        },
+    )?;
+
+    for (name, contents) in SSHD_BUNDLE {
+        if let Err(error) = write_state_file(
+            &work.join(name),
+            contents,
+            EXECUTABLE_MODE,
+            "sshd bundle executable",
+            false,
+        ) {
+            let _ = fs::remove_dir_all(&work);
+            return Err(error);
+        }
+    }
+
+    if let Err(error) = fs::rename(&work, &bundle) {
+        let _ = fs::remove_dir_all(&work);
+        return Err(Error::new(
+            ExitStatus::IoErr,
+            format!(
+                "failed to install sshd bundle {}: {error}",
+                bundle.display()
+            ),
+        ));
+    }
+    validate_sshd_bundle(&bundle)?;
+    Ok(bundle)
+}
+
+fn sshd_bundle_name() -> String {
+    let mut digest = Sha256::new();
+    for (name, contents) in SSHD_BUNDLE {
+        digest.update((name.len() as u64).to_le_bytes());
+        digest.update(name.as_bytes());
+        digest.update((contents.len() as u64).to_le_bytes());
+        digest.update(contents);
+    }
+    format!("{SSHD_BUNDLE_PREFIX}-{:x}", digest.finalize())
+}
+
+fn validate_sshd_bundle(bundle: &Path) -> Result<()> {
+    for (name, expected) in SSHD_BUNDLE {
+        let path = bundle.join(name);
+        validate_not_symlink(&path, "sshd bundle executable")?;
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|error| {
+                Error::new(
+                    ExitStatus::IoErr,
+                    format!(
+                        "failed to open sshd bundle executable {}: {error}",
+                        path.display()
+                    ),
+                )
+            })?;
+        validate_open_file(&file, &path, "sshd bundle executable")?;
+        let mode = file
+            .metadata()
+            .map_err(|error| {
+                Error::new(
+                    ExitStatus::IoErr,
+                    format!("failed to inspect sshd bundle executable: {error}"),
+                )
+            })?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode != EXECUTABLE_MODE {
+            return Err(Error::new(
+                ExitStatus::Config,
+                format!(
+                    "sshd bundle executable has unsafe permissions: {}",
+                    path.display()
+                ),
+            ));
+        }
+        let mut actual = Vec::with_capacity(expected.len());
+        file.read_to_end(&mut actual).map_err(|error| {
+            Error::new(
+                ExitStatus::IoErr,
+                format!(
+                    "failed to read sshd bundle executable {}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        if actual != expected {
+            return Err(Error::new(
+                ExitStatus::Config,
+                format!(
+                    "sshd bundle executable does not match embedded asset: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn write_authorized_keys_file(authorized_keys: &Path, contents: &[u8]) -> Result<()> {
@@ -609,6 +755,7 @@ fn add_ssh_mounts(
     authorized_keys: &Path,
     sshd_config: &Path,
     sshd_launcher: &Path,
+    sshd_bundle: &Path,
 ) -> Result<()> {
     let specs = [
         MountSpec {
@@ -624,6 +771,11 @@ fn add_ssh_mounts(
         MountSpec {
             source: sshd_launcher,
             destination: SSHD_LAUNCHER_DESTINATION,
+            options: &["bind", "ro", "nosuid", "nodev"],
+        },
+        MountSpec {
+            source: sshd_bundle,
+            destination: SSHD_BUNDLE_DESTINATION,
             options: &["bind", "ro", "nosuid", "nodev"],
         },
     ];
@@ -826,6 +978,7 @@ mod tests {
         let authorized_keys = Path::new("/tmp/sarus-hook-23961/authorized_keys");
         let sshd_config = Path::new("/tmp/sarus-hook-23961/sshd_config.podman");
         let sshd_launcher = Path::new("/tmp/sarus-hook-23961/hpc-dev-sshd");
+        let sshd_bundle = Path::new("/tmp/sarus-hook-23961/hpc-sshd-digest");
         let mut config = json!({ "process": {}, "mounts": [] });
 
         add_ssh_mounts(
@@ -833,6 +986,7 @@ mod tests {
             authorized_keys,
             sshd_config,
             sshd_launcher,
+            sshd_bundle,
         )
         .unwrap();
 
@@ -846,5 +1000,40 @@ mod tests {
             launcher["options"],
             json!(["bind", "ro", "nosuid", "nodev"])
         );
+
+        let bundle = config["mounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|mount| mount["destination"] == SSHD_BUNDLE_DESTINATION)
+            .unwrap();
+        assert_eq!(bundle["source"], sshd_bundle.to_str().unwrap());
+        assert_eq!(bundle["options"], json!(["bind", "ro", "nosuid", "nodev"]));
+    }
+
+    #[test]
+    fn versions_the_sshd_bundle_by_its_contents() {
+        let name = sshd_bundle_name();
+        assert!(name.starts_with("hpc-sshd-"));
+        assert_eq!(name.len(), "hpc-sshd-".len() + 64);
+    }
+
+    #[test]
+    fn stages_and_reuses_the_embedded_sshd_bundle() {
+        let state = std::env::temp_dir().join(format!(
+            "ssh-precreate-hook-test-{}-{}",
+            process::id(),
+            nonce().unwrap()
+        ));
+        fs::create_dir(&state).unwrap();
+
+        let first = ensure_sshd_bundle(&state).unwrap();
+        let second = ensure_sshd_bundle(&state).unwrap();
+        assert_eq!(first, second);
+        for (name, _) in SSHD_BUNDLE {
+            assert!(first.join(name).is_file());
+        }
+
+        fs::remove_dir_all(state).unwrap();
     }
 }
