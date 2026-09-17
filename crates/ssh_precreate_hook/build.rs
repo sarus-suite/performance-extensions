@@ -1,6 +1,6 @@
 use std::{env, fs, path::PathBuf};
 
-const BINARIES: [&str; 3] = ["sshd", "sshd-auth", "sshd-session"];
+const BINARIES: [&str; 4] = ["sshd", "sshd-auth", "sshd-session", "ssh-keygen"];
 
 fn main() {
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("Cargo must provide target arch");

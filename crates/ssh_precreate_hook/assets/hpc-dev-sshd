@@ -12,7 +12,7 @@ state=${HPC_DEV_SSH_DIR:-/tmp/hpc-dev-ssh-$uid}
 case "$state" in /*) ;; *) fail "HPC_DEV_SSH_DIR must be an absolute path" ;; esac
 key=$state/ssh_host_ed25519_key
 bundle=/usr/local/libexec/hpc-sshd
-for executable in sshd sshd-auth sshd-session; do
+for executable in sshd sshd-auth sshd-session ssh-keygen; do
     [ -x "$bundle/$executable" ] || fail "missing bundled $executable"
 done
 
@@ -23,7 +23,7 @@ prepare() {
     [ -O "$state" ] || fail "SSH state directory must belong to the current user"
     chmod 0700 "$state"
     if [ ! -f "$key" ]; then
-        ssh-keygen -q -t ed25519 -N '' -f "$key"
+        "$bundle/ssh-keygen" -q -t ed25519 -N '' -f "$key"
     fi
     # This may fail on the target OpenSSH build. Leave the account untouched.
     "$bundle/sshd" -t -f /etc/ssh/sshd_config.podman \

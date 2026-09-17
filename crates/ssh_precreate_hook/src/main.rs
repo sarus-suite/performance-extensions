@@ -32,10 +32,11 @@ const EXECUTABLE_MODE: u32 = 0o755;
 const AUTHORIZED_KEY_ANNOTATION: &str = "ssh.authorized_key";
 const SSHD_CONFIG: &[u8] = include_bytes!("../assets/sshd_config.podman");
 const SSHD_LAUNCHER: &[u8] = include_bytes!("../assets/hpc-dev-sshd");
-const SSHD_BUNDLE: [(&str, &[u8]); 3] = [
+const SSHD_BUNDLE: [(&str, &[u8]); 4] = [
     ("sshd", include_bytes!("../assets/sshd")),
     ("sshd-auth", include_bytes!("../assets/sshd-auth")),
     ("sshd-session", include_bytes!("../assets/sshd-session")),
+    ("ssh-keygen", include_bytes!("../assets/ssh-keygen")),
 ];
 
 fn main() {
