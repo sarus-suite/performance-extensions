@@ -14,7 +14,8 @@ use precreate_hook_diagnostics::{write_error, ExitStatus};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
-const STATE_DIR_PREFIX: &str = "sarus-hook-";
+const USER_RUNTIME_ROOT: &str = "/run/user";
+const STATE_DIR_NAME: &str = "sarus-hook";
 const AUTHORIZED_KEYS_NAME: &str = "authorized_keys";
 const IDENTITY_NAME: &str = "identity";
 const DESTINATION: &str = "/etc/ssh/hpc-dev-authorized_keys";
@@ -24,6 +25,8 @@ const SSHD_LAUNCHER_NAME: &str = "hpc-dev-sshd";
 const SSHD_LAUNCHER_DESTINATION: &str = "/usr/local/bin/hpc-dev-sshd";
 const SSHD_BUNDLE_PREFIX: &str = "hpc-sshd";
 const SSHD_BUNDLE_DESTINATION: &str = "/usr/local/libexec/hpc-sshd";
+const SSHD_RUNTIME_NAME: &str = "hpc-dev-ssh";
+const SSHD_RUNTIME_DESTINATION: &str = "/run/hpc-dev-ssh";
 const DIRECTORY_MODE: u32 = 0o700;
 const BUNDLE_DIRECTORY_MODE: u32 = 0o755;
 const FILE_MODE: u32 = 0o600;
@@ -103,12 +106,14 @@ fn run() -> Result<()> {
         }
     };
     let (sshd_config, sshd_launcher, sshd_bundle) = ensure_sshd_assets(&state)?;
+    let sshd_runtime = ensure_sshd_runtime(&state)?;
     add_ssh_mounts(
         config_object,
         &authorized_keys,
         &sshd_config,
         &sshd_launcher,
         &sshd_bundle,
+        &sshd_runtime,
     )?;
     write_stdout_json(&config)
 }
@@ -150,6 +155,10 @@ fn write_stdout_json(value: &Value) -> Result<()> {
 
 fn state_directory() -> Result<PathBuf> {
     let state = state_directory_path()?;
+    let user_runtime = state
+        .parent()
+        .expect("state directory always has a per-user runtime parent");
+    validate_directory(user_runtime, "per-user runtime directory")?;
     match fs::create_dir(&state) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -178,7 +187,9 @@ fn state_directory_path() -> Result<PathBuf> {
 }
 
 fn state_directory_path_for_uid(uid: u32) -> PathBuf {
-    PathBuf::from("/tmp").join(format!("{STATE_DIR_PREFIX}{uid}"))
+    PathBuf::from(USER_RUNTIME_ROOT)
+        .join(uid.to_string())
+        .join(STATE_DIR_NAME)
 }
 
 fn state_owner_uid() -> Result<u32> {
@@ -257,14 +268,20 @@ fn validate_directory(path: &Path, label: &str) -> Result<()> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         Error::new(
             ExitStatus::Config,
-            format!("{label} is not an accessible directory: {error}"),
+            format!(
+                "{label} {} is not an accessible directory: {error}",
+                path.display()
+            ),
         )
     })?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.uid() != effective_uid()
     {
         return Err(Error::new(
             ExitStatus::Config,
-            format!("{label} must be a real directory owned by the effective user"),
+            format!(
+                "{label} {} must be a real directory owned by the effective user",
+                path.display()
+            ),
         ));
     }
     Ok(())
@@ -492,6 +509,31 @@ fn ensure_sshd_assets(state: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
     )?;
     let bundle = ensure_sshd_bundle(state)?;
     Ok((config, launcher, bundle))
+}
+
+fn ensure_sshd_runtime(state: &Path) -> Result<PathBuf> {
+    let runtime = state.join(SSHD_RUNTIME_NAME);
+    match fs::create_dir(&runtime) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(Error::new(
+                ExitStatus::IoErr,
+                format!(
+                    "failed to create sshd runtime directory {}: {error}",
+                    runtime.display()
+                ),
+            ));
+        }
+    }
+    validate_directory(&runtime, "sshd runtime directory")?;
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(DIRECTORY_MODE)).map_err(|error| {
+        Error::new(
+            ExitStatus::IoErr,
+            format!("failed to set sshd runtime directory permissions: {error}"),
+        )
+    })?;
+    Ok(runtime)
 }
 
 fn ensure_sshd_bundle(state: &Path) -> Result<PathBuf> {
@@ -757,6 +799,7 @@ fn add_ssh_mounts(
     sshd_config: &Path,
     sshd_launcher: &Path,
     sshd_bundle: &Path,
+    sshd_runtime: &Path,
 ) -> Result<()> {
     let specs = [
         MountSpec {
@@ -778,6 +821,11 @@ fn add_ssh_mounts(
             source: sshd_bundle,
             destination: SSHD_BUNDLE_DESTINATION,
             options: &["bind", "ro", "nosuid", "nodev"],
+        },
+        MountSpec {
+            source: sshd_runtime,
+            destination: SSHD_RUNTIME_DESTINATION,
+            options: &["bind", "rw", "nosuid", "nodev", "noexec"],
         },
     ];
     add_mounts(config, &specs)
@@ -933,10 +981,10 @@ mod tests {
     }
 
     #[test]
-    fn uses_a_per_uid_tmp_state_directory() {
+    fn uses_the_per_uid_runtime_directory() {
         assert_eq!(
             state_directory_path_for_uid(23_961),
-            PathBuf::from("/tmp/sarus-hook-23961")
+            PathBuf::from("/run/user/23961/sarus-hook")
         );
     }
 
@@ -976,10 +1024,11 @@ mod tests {
 
     #[test]
     fn adds_executable_sshd_launcher_mount() {
-        let authorized_keys = Path::new("/tmp/sarus-hook-23961/authorized_keys");
-        let sshd_config = Path::new("/tmp/sarus-hook-23961/sshd_config.podman");
-        let sshd_launcher = Path::new("/tmp/sarus-hook-23961/hpc-dev-sshd");
-        let sshd_bundle = Path::new("/tmp/sarus-hook-23961/hpc-sshd-digest");
+        let authorized_keys = Path::new("/run/user/23961/sarus-hook/authorized_keys");
+        let sshd_config = Path::new("/run/user/23961/sarus-hook/sshd_config.podman");
+        let sshd_launcher = Path::new("/run/user/23961/sarus-hook/hpc-dev-sshd");
+        let sshd_bundle = Path::new("/run/user/23961/sarus-hook/hpc-sshd-digest");
+        let sshd_runtime = Path::new("/run/user/23961/sarus-hook/hpc-dev-ssh");
         let mut config = json!({ "process": {}, "mounts": [] });
 
         add_ssh_mounts(
@@ -988,6 +1037,7 @@ mod tests {
             sshd_config,
             sshd_launcher,
             sshd_bundle,
+            sshd_runtime,
         )
         .unwrap();
 
@@ -1010,6 +1060,18 @@ mod tests {
             .unwrap();
         assert_eq!(bundle["source"], sshd_bundle.to_str().unwrap());
         assert_eq!(bundle["options"], json!(["bind", "ro", "nosuid", "nodev"]));
+
+        let runtime = config["mounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|mount| mount["destination"] == SSHD_RUNTIME_DESTINATION)
+            .unwrap();
+        assert_eq!(runtime["source"], sshd_runtime.to_str().unwrap());
+        assert_eq!(
+            runtime["options"],
+            json!(["bind", "rw", "nosuid", "nodev", "noexec"])
+        );
     }
 
     #[test]
