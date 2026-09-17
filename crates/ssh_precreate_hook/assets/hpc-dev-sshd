@@ -8,7 +8,7 @@ uid=$(id -u)
 [ "$uid" -ne 0 ] || fail "run as the user supplied by Sarus/Podman"
 user=$(id -un)
 case "$user" in ''|*[!a-zA-Z0-9_.-]*) fail "unsupported account name" ;; esac
-state=${HPC_DEV_SSH_DIR:-/tmp/hpc-dev-ssh-$uid}
+state=${HPC_DEV_SSH_DIR:-/run/hpc-dev-ssh}
 case "$state" in /*) ;; *) fail "HPC_DEV_SSH_DIR must be an absolute path" ;; esac
 key=$state/ssh_host_ed25519_key
 bundle=/usr/local/libexec/hpc-sshd
@@ -18,10 +18,10 @@ done
 
 prepare() {
     umask 077
-    mkdir -p "$state"
+    mkdir -p "$state" || fail "cannot create SSH state directory: $state"
     [ ! -L "$state" ] || fail "SSH state directory must not be a symlink"
     [ -O "$state" ] || fail "SSH state directory must belong to the current user"
-    chmod 0700 "$state"
+    chmod 0700 "$state" || fail "cannot protect SSH state directory: $state"
     if [ ! -f "$key" ]; then
         "$bundle/ssh-keygen" -q -t ed25519 -N '' -f "$key"
     fi
