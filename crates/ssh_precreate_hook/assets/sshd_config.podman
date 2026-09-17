@@ -7,7 +7,6 @@
 
 PermitRootLogin no
 LogLevel ERROR
-UsePAM no
 KbdInteractiveAuthentication no
 PermitTTY yes
 AllowTcpForwarding yes
