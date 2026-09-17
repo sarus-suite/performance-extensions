@@ -11,6 +11,10 @@ case "$user" in ''|*[!a-zA-Z0-9_.-]*) fail "unsupported account name" ;; esac
 state=${HPC_DEV_SSH_DIR:-$HOME/.local/state/hpc-dev/ssh}
 case "$state" in /*) ;; *) fail "HPC_DEV_SSH_DIR must be an absolute path" ;; esac
 key=$state/ssh_host_ed25519_key
+bundle=/usr/local/libexec/hpc-sshd
+for executable in sshd sshd-auth sshd-session; do
+    [ -x "$bundle/$executable" ] || fail "missing bundled $executable"
+done
 
 prepare() {
     umask 077
@@ -21,8 +25,12 @@ prepare() {
         ssh-keygen -q -t ed25519 -N '' -f "$key"
     fi
     # This may fail on the target OpenSSH build. Leave the account untouched.
-    /usr/sbin/sshd -t -f /etc/ssh/sshd_config.podman \
-        -h "$key" -o "AllowUsers=$user" -o "PidFile=$state/sshd.pid"
+    "$bundle/sshd" -t -f /etc/ssh/sshd_config.podman \
+        -h "$key" \
+        -o "SshdAuthPath=$bundle/sshd-auth" \
+        -o "SshdSessionPath=$bundle/sshd-session" \
+        -o "AllowUsers=$user" \
+        -o "PidFile=$state/sshd.pid"
 }
 
 case "${1:-}" in
@@ -35,5 +43,9 @@ case "${1:-}" in
 *) fail "usage: hpc-dev-sshd [--prepare]" ;;
 esac
 prepare
-exec /usr/sbin/sshd -i -e -f /etc/ssh/sshd_config.podman \
-    -h "$key" -o "AllowUsers=$user" -o "PidFile=$state/sshd.pid"
+exec "$bundle/sshd" -i -e -f /etc/ssh/sshd_config.podman \
+    -h "$key" \
+    -o "SshdAuthPath=$bundle/sshd-auth" \
+    -o "SshdSessionPath=$bundle/sshd-session" \
+    -o "AllowUsers=$user" \
+    -o "PidFile=$state/sshd.pid"
