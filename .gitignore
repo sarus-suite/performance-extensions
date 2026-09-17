@@ -4,6 +4,7 @@ target
 crates/ssh_precreate_hook/assets/sshd
 crates/ssh_precreate_hook/assets/sshd-auth
 crates/ssh_precreate_hook/assets/sshd-session
+crates/ssh_precreate_hook/assets/ssh-keygen
 crates/ssh_precreate_hook/assets/hpc-sshd.build-info
 crates/ssh_precreate_hook/assets/.hpc-sshd-stage.*
 

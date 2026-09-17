@@ -9,7 +9,7 @@ OPENSSH_SHA="${OPENSSH_SHA:-2593769fb291fe6c542173927698c69e9f9a08b9}"
 GLIBC_BASELINE="${HPC_SSHD_GLIBC_BASELINE:-2.34}"
 RECIPE_VERSION=1
 MANIFEST="${ASSET_DIR}/hpc-sshd.build-info"
-BINARIES=(sshd sshd-auth sshd-session)
+BINARIES=(sshd sshd-auth sshd-session ssh-keygen)
 
 log() { printf '[build-hpc-sshd] %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
