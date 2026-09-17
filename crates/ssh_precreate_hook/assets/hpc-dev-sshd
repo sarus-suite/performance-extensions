@@ -4,11 +4,11 @@
 
 set -eu
 fail() { echo "hpc-dev-sshd: $*" >&2; exit 1; }
-[ "$(id -u)" -ne 0 ] || fail "run as the user supplied by Sarus/Podman"
+uid=$(id -u)
+[ "$uid" -ne 0 ] || fail "run as the user supplied by Sarus/Podman"
 user=$(id -un)
 case "$user" in ''|*[!a-zA-Z0-9_.-]*) fail "unsupported account name" ;; esac
-: "${HOME:?runtime must supply HOME}"
-state=${HPC_DEV_SSH_DIR:-$HOME/.local/state/hpc-dev/ssh}
+state=${HPC_DEV_SSH_DIR:-/tmp/hpc-dev-ssh-$uid}
 case "$state" in /*) ;; *) fail "HPC_DEV_SSH_DIR must be an absolute path" ;; esac
 key=$state/ssh_host_ed25519_key
 bundle=/usr/local/libexec/hpc-sshd
@@ -19,6 +19,7 @@ done
 prepare() {
     umask 077
     mkdir -p "$state"
+    [ ! -L "$state" ] || fail "SSH state directory must not be a symlink"
     [ -O "$state" ] || fail "SSH state directory must belong to the current user"
     chmod 0700 "$state"
     if [ ! -f "$key" ]; then
