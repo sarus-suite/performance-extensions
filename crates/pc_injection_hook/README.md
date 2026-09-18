@@ -14,6 +14,13 @@ If the same setting is provided by both CLI args and env vars, the CLI value win
 Add args entries as needed in the OCI hook `args` array. `--lib`, `--dependency-lib`, `--file`,
 `--env`, and `--mount` may all be given more than once.
 
+CLI args support the syntax `${annotation:key}` to declare variables, which are replaced with the corresponding value
+from the container's OCI `annotations` before argument parsing. For example,
+`--env=MODE=${annotation:com.hooks.env.mode}` uses the value of the `com.hooks.env.mode` annotation.
+Keys must be nonempty and contain no whitespace; referenced annotations must exist and have
+string values. Expansion is not recursive: variable syntax inside an annotation value is left
+literal rather than expanded again.
+
 * `--ldconfig=/path/to/ldconfig`
   Specify the ldconfig binary on host to use by the hook, needed for manipulating the ld cache from the container bundle.
 * `--allow-unversioned-primary-overwrite`
