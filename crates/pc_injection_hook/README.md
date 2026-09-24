@@ -71,6 +71,21 @@ Example with multiple resource injection entries:
 }
 ```
 
+## Variable Expansion in CLI Args
+
+CLI args support the syntax `${annotation:key}` to declare variables, which are replaced with the corresponding value
+from the container's OCI `annotations` before argument parsing.
+
+For example, `--file=${annotation:com.hooks.inject.file}` uses the value of the `com.hooks.inject.file` annotation.
+
+Keys must be nonempty and contain no whitespace; referenced annotations must exist and have
+string values. Expansion is not recursive: variable syntax inside an annotation value is left
+literal rather than expanded again. Expansion inserts annotation values verbatim, including path
+separators and `..` components; each CLI option’s normal validation still applies.
+
+This hook currently targets use under rootless Podman.
+Privileged deployments should assess in which arguments to allow annotation expansion.
+
 ## Legacy Env Vars
 
 Use these only when CLI args are not practical.

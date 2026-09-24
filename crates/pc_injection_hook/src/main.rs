@@ -1,4 +1,5 @@
 use precreate_hook_diagnostics::{write_error, ExitStatus};
+use regex::regex;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -251,7 +252,7 @@ fn write_stdout_json(value: &Value) -> Result<()> {
 }
 
 fn load_inputs(config: &Value) -> Result<HookInputs> {
-    load_inputs_from_sources(config, parse_cli_overrides()?)
+    load_inputs_from_sources(config, parse_cli_overrides(config)?)
 }
 
 fn load_inputs_from_sources(config: &Value, cli: CliOverrides) -> Result<HookInputs> {
@@ -288,20 +289,23 @@ fn load_inputs_from_sources(config: &Value, cli: CliOverrides) -> Result<HookInp
     Ok(inputs)
 }
 
-fn parse_cli_overrides() -> Result<CliOverrides> {
-    parse_cli_overrides_from_args(env::args_os().skip(1))
+fn parse_cli_overrides(config: &Value) -> Result<CliOverrides> {
+    parse_cli_overrides_from_args(env::args_os().skip(1), config)
 }
 
-fn parse_cli_overrides_from_args<I>(args: I) -> Result<CliOverrides>
+fn parse_cli_overrides_from_args<I>(args: I, config: &Value) -> Result<CliOverrides>
 where
     I: IntoIterator<Item = std::ffi::OsString>,
 {
     let mut overrides = CliOverrides::default();
+    let annotations = config.get("annotations").and_then(Value::as_object);
 
     for arg in args {
         let arg = arg.into_string().map_err(|_| {
             Error::status_message(ExitStatus::Usage, "hook args must contain valid UTF-8")
         })?;
+
+        let arg = expand_cli_annotation_syntax(&arg, annotations)?;
 
         if let Some(value) = arg.strip_prefix("--ldconfig=") {
             overrides.ldconfig = Some(PathBuf::from(value));
@@ -368,6 +372,70 @@ fn validate_inputs(inputs: &HookInputs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn expand_cli_annotation_syntax(
+    input: &str,
+    annotations: Option<&Map<String, Value>>,
+) -> Result<String> {
+    let re = regex!(r"\$\{annotation:([^}]*)\}");
+
+    let mut captures = re.captures_iter(input).peekable();
+
+    if captures.peek().is_none() {
+        return Ok(input.to_owned());
+    }
+
+    let mut output = String::new();
+    let mut last_end = 0;
+
+    for caps in captures {
+        let annotation_key = caps.get(1).map_or("", |m| m.as_str());
+        if annotation_key.is_empty() {
+            return Err(Error::message(
+                "empty annotation key used in hook CLI argument",
+            ));
+        }
+        if annotation_key.chars().any(char::is_whitespace) {
+            return Err(Error::message(
+                format!("annotation key '{annotation_key}' used in hook CLI argument contains whitespace characters")
+            ));
+        }
+
+        let annotation_map = annotations.ok_or_else(|| {
+            Error::message(
+                "hook CLI argument uses annotation variable syntax but container has no annotations",
+            )
+        })?;
+
+        let value = annotation_map.get(annotation_key).ok_or_else(|| {
+            Error::message(format!(
+                "annotation '{annotation_key}' used in hook CLI argument is not defined for the container"
+            ))
+        })?;
+
+        let annotation_value = value.as_str().ok_or_else(|| {
+            Error::status_message(
+                ExitStatus::DataErr,
+                format!("OCI spec violation: annotation '{annotation_key}' value is not string"),
+            )
+        })?;
+
+        let whole = caps.get(0).unwrap();
+
+        // Copy everything before this variable.
+        output.push_str(&input[last_end..whole.start()]);
+
+        output.push_str(annotation_value);
+
+        // Move the byte offset for reading the input string at the end of the variable that was just replaced
+        last_end = whole.end();
+    }
+
+    // Copy whatever remains after the final match.
+    output.push_str(&input[last_end..]);
+
+    Ok(output)
 }
 
 fn prefer_cli_vec<T>(cli: Vec<T>, env: Vec<T>) -> Vec<T> {
@@ -2086,15 +2154,145 @@ mod tests {
     }
 
     #[test]
+    fn annotation_syntax_preserves_input_without_variables() {
+        for input in ["", "--env=MODE=production"] {
+            assert_eq!(expand_cli_annotation_syntax(input, None).unwrap(), input);
+        }
+    }
+
+    #[test]
+    fn annotation_syntax_substitutes_variables() {
+        let annotations =
+            json!({"first": "alpha", "second": "beta", "empty": "", "unicode": "世界"});
+        for (input, expected) in [
+            ("${annotation:first}", "alpha"),
+            ("${annotation:first}${annotation:second}", "alphabeta"),
+            ("${annotation:first}/${annotation:first}", "alpha/alpha"),
+            ("prefix-${annotation:first}-suffix", "prefix-alpha-suffix"),
+            ("before${annotation:empty}after", "beforeafter"),
+            ("é-${annotation:unicode}-終", "é-世界-終"),
+        ] {
+            assert_eq!(
+                expand_cli_annotation_syntax(input, annotations.as_object()).unwrap(),
+                expected,
+                "input: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn annotation_syntax_rejects_invalid_keys() {
+        let annotations = json!({});
+        for (input, expected) in [
+            (
+                "${annotation:}",
+                "empty annotation key used in hook CLI argument",
+            ),
+            (
+                "${annotation:bad key}",
+                "annotation key 'bad key' used in hook CLI argument contains whitespace characters",
+            ),
+            (
+                "${annotation:bad\tkey}",
+                "annotation key 'bad\tkey' used in hook CLI argument contains whitespace characters",
+            ),
+        ] {
+            let error = expand_cli_annotation_syntax(input, annotations.as_object()).unwrap_err();
+            assert_eq!(error.exit_status(), ExitStatus::Config, "input: {input:?}");
+            assert_eq!(error.to_string(), expected, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn annotation_syntax_reports_lookup_failures() {
+        let annotations = json!({"numeric": 42});
+        for (input, map, status, expected) in [
+            (
+                "${annotation:missing}",
+                None,
+                ExitStatus::Config,
+                "hook CLI argument uses annotation variable syntax but container has no annotations",
+            ),
+            (
+                "${annotation:missing}",
+                annotations.as_object(),
+                ExitStatus::Config,
+                "annotation 'missing' used in hook CLI argument is not defined for the container",
+            ),
+            (
+                "${annotation:numeric}",
+                annotations.as_object(),
+                ExitStatus::DataErr,
+                "OCI spec violation: annotation 'numeric' value is not string",
+            ),
+        ] {
+            let error = expand_cli_annotation_syntax(input, map).unwrap_err();
+            assert_eq!(error.exit_status(), status, "expected: {expected}");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn cli_parsing_expands_annotation_variables() {
+        let temp_root = unique_temp_path("cli-annotation-variables");
+        fs::create_dir_all(&temp_root).unwrap();
+        let config = json!({
+            "annotations": {
+                "mode": "production",
+                "name": "tool.conf",
+                "source": temp_root.to_str().unwrap(),
+                "destination": "/container/data",
+                "options": "bind,ro"
+            }
+        });
+
+        let overrides = parse_cli_overrides_from_args(
+            vec![
+                "--env=MODE=${annotation:mode}".into(),
+                "--file=/opt/${annotation:name}".into(),
+                "--mount=${annotation:source}:${annotation:destination}:${annotation:options}"
+                    .into(),
+            ],
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(overrides.extra_env, vec!["MODE=production".to_string()]);
+        assert_eq!(overrides.extra_files, vec![PathBuf::from("/opt/tool.conf")]);
+        assert_eq!(
+            overrides.extra_mounts,
+            vec![ExtraMountEdit {
+                source: fs::canonicalize(&temp_root).unwrap(),
+                destination: PathBuf::from("/container/data"),
+                mount_type: "bind".to_string(),
+                options: vec!["bind".to_string(), "ro".to_string()],
+            }]
+        );
+
+        let error =
+            parse_cli_overrides_from_args(vec!["--env=MODE=${annotation:missing}".into()], &config)
+                .unwrap_err();
+        assert_eq!(error.exit_status(), ExitStatus::Config);
+        assert_eq!(
+            error.to_string(),
+            "annotation 'missing' used in hook CLI argument is not defined for the container"
+        );
+
+        fs::remove_dir_all(&temp_root).unwrap();
+    }
+
+    #[test]
     fn unsupported_cli_argument_is_usage_error() {
-        let error = parse_cli_overrides_from_args(vec!["--unsupported-arg".into()]).unwrap_err();
+        let error = parse_cli_overrides_from_args(vec!["--unsupported-arg".into()], &json!({}))
+            .unwrap_err();
         assert_eq!(error.exit_status(), ExitStatus::Usage);
         assert_eq!(error.to_string(), "unsupported argument: --unsupported-arg");
     }
 
     #[test]
     fn cli_and_environment_validation_use_distinct_categories() {
-        let cli_error = parse_cli_overrides_from_args(vec!["--env=INVALID".into()]).unwrap_err();
+        let cli_error =
+            parse_cli_overrides_from_args(vec!["--env=INVALID".into()], &json!({})).unwrap_err();
         assert_eq!(cli_error.exit_status(), ExitStatus::Usage);
 
         let config_error = validate_kv_format("INVALID").unwrap_err();
@@ -2252,18 +2450,21 @@ mod tests {
         fs::write(&dependency, b"payload").unwrap();
         fs::write(&extra_file, b"driver mlx5\n").unwrap();
 
-        let overrides = parse_cli_overrides_from_args(vec![
-            "--ldconfig=/sbin/ldconfig".into(),
-            format!("--lib={}", primary.display()).into(),
-            format!("--dependency-lib={}", dependency.display()).into(),
-            format!("--file={}", extra_file.display()).into(),
-            "--env=MPIR_CVAR_CH4_OFI_MULTI_NIC_STRIPING_THRESHOLD=100000000".into(),
-            format!(
-                "--mount={}:/var/spool/slurmd:bind,rw,nosuid,noexec,nodev,private",
-                extra_mount_source.display()
-            )
-            .into(),
-        ])
+        let overrides = parse_cli_overrides_from_args(
+            vec![
+                "--ldconfig=/sbin/ldconfig".into(),
+                format!("--lib={}", primary.display()).into(),
+                format!("--dependency-lib={}", dependency.display()).into(),
+                format!("--file={}", extra_file.display()).into(),
+                "--env=MPIR_CVAR_CH4_OFI_MULTI_NIC_STRIPING_THRESHOLD=100000000".into(),
+                format!(
+                    "--mount={}:/var/spool/slurmd:bind,rw,nosuid,noexec,nodev,private",
+                    extra_mount_source.display()
+                )
+                .into(),
+            ],
+            &json!({}),
+        )
         .unwrap();
 
         assert_eq!(overrides.ldconfig, Some(PathBuf::from("/sbin/ldconfig")));
@@ -2338,17 +2539,20 @@ mod tests {
         let config = serde_json::json!({
             "root": { "path": rootfs.display().to_string() }
         });
-        let cli = parse_cli_overrides_from_args(vec![
-            "--ldconfig=/cli/ldconfig".into(),
-            format!("--lib={}", cli_primary.display()).into(),
-            format!("--file={}", cli_file.display()).into(),
-            "--env=CLI_WINS=1".into(),
-            format!(
-                "--mount={}:/var/spool/slurmd:bind,rw,nosuid,noexec,nodev,private",
-                cli_mount_source.display()
-            )
-            .into(),
-        ])
+        let cli = parse_cli_overrides_from_args(
+            vec![
+                "--ldconfig=/cli/ldconfig".into(),
+                format!("--lib={}", cli_primary.display()).into(),
+                format!("--file={}", cli_file.display()).into(),
+                "--env=CLI_WINS=1".into(),
+                format!(
+                    "--mount={}:/var/spool/slurmd:bind,rw,nosuid,noexec,nodev,private",
+                    cli_mount_source.display()
+                )
+                .into(),
+            ],
+            &config,
+        )
         .unwrap();
 
         let inputs = load_inputs_from_sources(&config, cli).unwrap();
