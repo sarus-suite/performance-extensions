@@ -1,12 +1,12 @@
 # PMIx - Precreate Hook
 
-Add PMIx folders bind mounts to container mount list, based on PMIx entries in container environment.
+Add PMIx environment variables and bind mounts to container config, based on SLURM and PMIx entries in container environment.
 
 **What it does**
 
 * Reads the **container config JSON** from `stdin` and emits the updated config to `stdout`. 
-* Looks for SLURM_MPI_TYPE, PMIX_SERVER_TMPDIR and PMIX_SYSTEM_TMPDIR from container config.
-* Adds bind mounts related to PMIx folders to container config if needed.
+* Looks for SLURM_\*, and PMIX_\* environment variables from container config.
+* Adds environment variables and bind mounts related to PMIx to container config if needed.
 * Pretty-prints output and exits non-zero on validation/parse errors (errors go to `stderr`). 
 
 ## Usage as a Podman hook
