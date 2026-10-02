@@ -117,17 +117,19 @@ fn apply_pmix_updates(obj: &mut Map<String, Value>) -> Result<()> {
 
         if !pmix_server_tmpdir.is_empty() {
             let folder = pmix_server_tmpdir.trim_end_matches('/');
-            add_mount(obj, &folder)?;
+            if PathBuf::from(&folder).is_dir() {
+                add_mount(obj, &folder)?;
+            }
         }
         if !pmix_system_tmpdir.is_empty() {
             let folder = pmix_system_tmpdir.trim_end_matches('/');
             let folder_format1 =
                 format!("{folder}/spmix_appdir_{slurm_job_id}_{slurm_job_id}.{slurm_step_id}");
+            let folder_format2 = format!("{folder}/spmix_appdir_{slurm_job_id}.{slurm_step_id}");
+
             if PathBuf::from(&folder_format1).is_dir() {
                 add_mount(obj, &folder_format1)?;
-            } else {
-                let folder_format2 =
-                    format!("{folder}/spmix_appdir_{slurm_job_id}.{slurm_step_id}");
+            } else if PathBuf::from(&folder_format2).is_dir() {
                 add_mount(obj, &folder_format2)?;
             }
         }
