@@ -1,6 +1,6 @@
 use oci_spec::runtime::MountBuilder;
 use precreate_hook_diagnostics::{write_error, ExitStatus};
-use serde_json::{json, map::Entry, Map, Value};
+use serde_json::{Map, Value};
 use std::{
     collections::HashMap,
     fmt,
@@ -49,73 +49,18 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 fn run() -> Result<()> {
-    // Read and parse stdin JSON
     let mut value = read_stdin_json()?;
     let obj = ensure_obj(value.as_object_mut(), "top-level JSON must be an object")?;
-    let container_env = get_process_env_hashmap(obj)?;
+    apply_pmix_updates(obj)?;
+    write_stdout_json(&value)?;
+    Ok(())
+}
 
-    let slurm_job_id = get_env_entry_str(container_env.clone(), String::from("SLURM_JOB_ID"));
-    let slurm_step_id = get_env_entry_str(container_env.clone(), String::from("SLURM_STEP_ID"));
-
-    if (slurm_job_id == "") || (slurm_step_id == "") {
-        return Ok(());
-    }
-
-    let slurm_mpi_type = get_env_entry_str(container_env.clone(), String::from("SLURM_MPI_TYPE"));
-    let pmix_found = is_pattern_in_env_keys(container_env.clone(), "PMIX_");
-
-    if ((slurm_mpi_type == "") || slurm_mpi_type.starts_with("pmix")) && pmix_found {
-        let pmix_ptl_module =
-            get_env_entry_str(container_env.clone(), String::from("PMIX_PTL_MODULE"));
-        let pmix_mca_ptl = get_env_entry_str(container_env.clone(), String::from("PMIX_MCA_ptl"));
-
-        if pmix_ptl_module != "" && pmix_mca_ptl == "" {
-            insert_process_env(obj, "PMIX_MCA_ptl", &pmix_ptl_module)?;
-        }
-
-        let pmix_security_mode =
-            get_env_entry_str(container_env.clone(), String::from("PMIX_SECURITY_MODE"));
-        let pmix_mca_psec = get_env_entry_str(container_env.clone(), String::from("PMIX_MCA_psec"));
-
-        if pmix_security_mode != "" && pmix_mca_psec == "" {
-            insert_process_env(obj, "PMIX_MCA_psec", &pmix_security_mode)?;
-        }
-
-        let pmix_gds_module =
-            get_env_entry_str(container_env.clone(), String::from("PMIX_GDS_MODULE"));
-        let pmix_mca_gds = get_env_entry_str(container_env.clone(), String::from("PMIX_MCA_gds"));
-
-        if pmix_gds_module != "" && pmix_mca_gds == "" {
-            insert_process_env(obj, "PMIX_MCA_gds", &pmix_gds_module)?;
-        }
-
-        let pmix_server_tmpdir =
-            get_env_entry_str(container_env.clone(), String::from("PMIX_SERVER_TMPDIR"));
-        let pmix_system_tmpdir =
-            get_env_entry_str(container_env.clone(), String::from("PMIX_SYSTEM_TMPDIR"));
-
-        if pmix_server_tmpdir != "" {
-            let folder = pmix_server_tmpdir.trim_end_matches('/');
-            add_mount(obj, &folder);
-        }
-        if pmix_system_tmpdir != "" {
-            let folder = pmix_system_tmpdir.trim_end_matches('/');
-            let folder_format1 =
-                format!("{folder}/spmix_appdir_{slurm_job_id}_{slurm_job_id}.{slurm_step_id}");
-            if PathBuf::from(&folder_format1).is_dir() {
-                add_mount(obj, &folder_format1);
-            } else {
-                let folder_format2 =
-                    format!("{folder}/spmix_appdir_{slurm_job_id}.{slurm_step_id}");
-                add_mount(obj, &folder_format2);
-            }
-        }
-    }
-
-    // Pretty-print output JSON with trailing newline
+// Pretty-print output JSON with trailing newline
+fn write_stdout_json(value: &Value) -> Result<()> {
     let mut stdout = io::stdout().lock();
 
-    serde_json::to_writer_pretty(&mut stdout, &value).map_err(|e| {
+    serde_json::to_writer_pretty(&mut stdout, value).map_err(|e| {
         Error::new(
             ExitStatus::Software,
             format!("Failed to write JSON to stdout: {e}"),
@@ -128,6 +73,7 @@ fn run() -> Result<()> {
             format!("Failed to write newline to stdout: {e}"),
         )
     })?;
+
     stdout
         .flush()
         .map_err(|e| Error::new(ExitStatus::IoErr, format!("Failed to flush stdout: {e}")))?;
@@ -135,15 +81,71 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-fn get_env_entry_str(env: HashMap<String, String>, key: String) -> String {
-    let ret = match env.get(&key) {
-        Some(v) => v.clone(),
-        None => String::from(""),
-    };
-    ret
+fn apply_pmix_updates(obj: &mut Map<String, Value>) -> Result<()> {
+    let container_env = get_process_env_hashmap(obj)?;
+
+    let slurm_job_id = get_env_entry_str(&container_env, "SLURM_JOB_ID");
+    let slurm_step_id = get_env_entry_str(&container_env, "SLURM_STEP_ID");
+
+    // Skip it when outside of a JOB or if SLURM_* variables are not available
+    if (slurm_job_id.is_empty()) || (slurm_step_id.is_empty()) {
+        return Ok(());
+    }
+
+    let slurm_mpi_type = get_env_entry_str(&container_env, "SLURM_MPI_TYPE");
+    let pmix_found = is_pattern_in_env_keys(&container_env, "PMIX_");
+
+    if ((slurm_mpi_type.is_empty()) || slurm_mpi_type.starts_with("pmix")) && pmix_found {
+        let pmix_ptl_module = get_env_entry_str(&container_env, "PMIX_PTL_MODULE");
+        let pmix_mca_ptl = get_env_entry_str(&container_env, "PMIX_MCA_ptl");
+
+        if !pmix_ptl_module.is_empty() && pmix_mca_ptl.is_empty() {
+            insert_process_env(obj, "PMIX_MCA_ptl", &pmix_ptl_module)?;
+        }
+
+        let pmix_security_mode = get_env_entry_str(&container_env, "PMIX_SECURITY_MODE");
+        let pmix_mca_psec = get_env_entry_str(&container_env, "PMIX_MCA_psec");
+
+        if !pmix_security_mode.is_empty() && pmix_mca_psec.is_empty() {
+            insert_process_env(obj, "PMIX_MCA_psec", &pmix_security_mode)?;
+        }
+
+        let pmix_gds_module = get_env_entry_str(&container_env, "PMIX_GDS_MODULE");
+        let pmix_mca_gds = get_env_entry_str(&container_env, "PMIX_MCA_gds");
+
+        if !pmix_gds_module.is_empty() && pmix_mca_gds.is_empty() {
+            insert_process_env(obj, "PMIX_MCA_gds", &pmix_gds_module)?;
+        }
+
+        let pmix_server_tmpdir = get_env_entry_str(&container_env, "PMIX_SERVER_TMPDIR");
+        let pmix_system_tmpdir = get_env_entry_str(&container_env, "PMIX_SYSTEM_TMPDIR");
+
+        if !pmix_server_tmpdir.is_empty() {
+            let folder = pmix_server_tmpdir.trim_end_matches('/');
+            add_mount(obj, &folder)?;
+        }
+        if !pmix_system_tmpdir.is_empty() {
+            let folder = pmix_system_tmpdir.trim_end_matches('/');
+            let folder_format1 =
+                format!("{folder}/spmix_appdir_{slurm_job_id}_{slurm_job_id}.{slurm_step_id}");
+            if PathBuf::from(&folder_format1).is_dir() {
+                add_mount(obj, &folder_format1)?;
+            } else {
+                let folder_format2 =
+                    format!("{folder}/spmix_appdir_{slurm_job_id}.{slurm_step_id}");
+                add_mount(obj, &folder_format2)?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
-fn is_pattern_in_env_keys(env: HashMap<String, String>, pattern: &str) -> bool {
+fn get_env_entry_str<'a>(env: &'a HashMap<String, String>, key: &str) -> &'a str {
+    env.get(key).map(|s| s.as_str()).unwrap_or("")
+}
+
+fn is_pattern_in_env_keys<'a>(env: &'a HashMap<String, String>, pattern: &str) -> bool {
     for (k, _v) in env.iter() {
         if k.starts_with(pattern) {
             return true;
@@ -152,16 +154,11 @@ fn is_pattern_in_env_keys(env: HashMap<String, String>, pattern: &str) -> bool {
     false
 }
 
-fn add_mount(obj: &mut Map<String, Value>, folder: &str) {
-    let mut found = false;
-    let opts = vec![
-        String::from("private"),
-        String::from("nosuid"),
-        String::from("noexec"),
-        String::from("nodev"),
-        String::from("rw"),
-        String::from("bind"),
-    ];
+fn add_mount(obj: &mut Map<String, Value>, folder: &str) -> Result<()> {
+    let opts: Vec<String> = vec!["private", "nosuid", "noexec", "nodev", "rw", "bind"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
 
     let new_mount = MountBuilder::default()
         .typ("bind")
@@ -169,155 +166,63 @@ fn add_mount(obj: &mut Map<String, Value>, folder: &str) {
         .source(folder)
         .destination(folder)
         .build()
-        .unwrap();
+        .map_err(|e| Error::new(ExitStatus::DataErr, format!("invalid new mount: {e}")))?;
 
-    let new_mount_value = serde_json::to_value(new_mount).unwrap();
+    let new_mount_value = serde_json::to_value(new_mount).map_err(|e| {
+        Error::new(
+            ExitStatus::DataErr,
+            format!("unable to serialize new mount: {e}"),
+        )
+    })?;
 
-    for (k, v) in &mut *obj {
-        if k == "mounts" {
-            found = true;
-            if !v.is_array() {
-                return;
-            };
-            let mut new_v = v.as_array().unwrap().clone();
-            new_v.push(new_mount_value.clone());
-            obj.insert("mounts".to_string(), serde_json::Value::Array(new_v));
-            break;
+    match obj.get_mut("mounts") {
+        Some(Value::Array(arr)) => arr.push(new_mount_value),
+        Some(_) => {
+            return Err(Error::new(
+                ExitStatus::DataErr,
+                "Validation error: 'mounts' is not an array",
+            ))
+        }
+        None => {
+            obj.insert("mounts".to_string(), Value::Array(vec![new_mount_value]));
         }
     }
-    if !found {
-        let mounts = serde_json::to_value(vec![new_mount_value]).unwrap();
-        obj.insert(String::from("mounts"), mounts);
-    }
+    Ok(())
 }
 
 fn insert_process_env(obj: &mut Map<String, Value>, key: &str, value: &str) -> Result<()> {
-    // Ensure "process" exists
-    let process_val = obj.entry("process".to_string());
-    match process_val {
-        Entry::Vacant(_) => {
-            return Err(Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'process' doesn't exist.",
-            ))
-        }
-        Entry::Occupied(_) => {}
-    }
-
-    // Ensure "process" is an object
-    let process_obj = process_val
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'process' exists but is not an object.",
-            )
-        })?;
-
-    // Ensure "env" exists
-    let env_val = process_obj.entry("env".to_string());
-    match env_val {
-        Entry::Vacant(_) => {
-            return Err(Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'process.env' doesn't exist.",
-            ))
-        }
-        Entry::Occupied(_) => {}
-    }
-
-    let env_array = env_val
-        .or_insert_with(|| json!({}))
-        .as_array_mut()
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'process.env' exists but is not an array.",
-            )
-        })?;
-
-    let mut new_env_array = vec![];
+    let env_array = get_process_env_array(obj)?;
 
     let mut found = false;
-    for entry in env_array.iter() {
-        if !entry.is_string() {
-            return Err(Error::new(
+    for entry in env_array.iter_mut() {
+        let s = entry.as_str().ok_or_else(|| {
+            Error::new(
                 ExitStatus::DataErr,
-                "Validation error: 'process.env' array contains an item that is not a string",
-            ));
-        }
+                format!(
+                    "Validation error: 'process.env' array contains an item that is not a string"
+                ),
+            )
+        })?;
 
-        let (k, v) = match entry.as_str().unwrap().split_once("=") {
-            Some(s) => s,
-            None => {
-                return Err(Error::new(
-                    ExitStatus::DataErr,
-                    "Validation error: 'process.env' array contains an item that doesn't contain '=' separator",
-                ))
-            },
-        };
+        let (k, _) = s.split_once('=')
+            .ok_or_else(|| Error::new(ExitStatus::DataErr,
+                    format!("Validation error: 'process.env' array contains an item that doesn't contain '=' separator")))?;
 
         if k == key {
+            *entry = format!("{key}={value}").into();
             found = true;
-            new_env_array.push(format!("{key}={value}").into());
-        } else {
-            new_env_array.push(format!("{k}={v}").into());
+            break;
         }
     }
-    if !found {
-        new_env_array.push(format!("{key}={value}").into());
-    }
 
-    process_obj.insert(String::from("env"), serde_json::Value::Array(new_env_array));
+    if !found {
+        env_array.push(format!("{key}={value}").into());
+    }
     Ok(())
 }
 
 fn get_process_env_hashmap(obj: &mut Map<String, Value>) -> Result<HashMap<String, String>> {
-    // Ensure "process" exists
-    let process_val = obj.entry("process".to_string());
-    match process_val {
-        Entry::Vacant(_) => {
-            return Err(Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'process' doesn't exist.",
-            ))
-        }
-        Entry::Occupied(_) => {}
-    }
-
-    // Ensure "process" is an object
-    let process_obj = process_val
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'process' exists but is not an object.",
-            )
-        })?;
-
-    // Ensure "env" exists
-    let env_val = process_obj.entry("env".to_string());
-    match env_val {
-        Entry::Vacant(_) => {
-            return Err(Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'process.env' doesn't exist.",
-            ))
-        }
-        Entry::Occupied(_) => {}
-    }
-
-    let env_array = env_val
-        .or_insert_with(|| json!({}))
-        .as_array_mut()
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'process.env' exists but is not an array.",
-            )
-        })?;
+    let env_array = get_process_env_array(obj)?;
 
     let mut ret = HashMap::new();
 
@@ -342,6 +247,37 @@ fn get_process_env_hashmap(obj: &mut Map<String, Value>) -> Result<HashMap<Strin
         ret.insert(String::from(k), String::from(v));
     }
     Ok(ret)
+}
+
+fn get_process_env_array(obj: &mut Map<String, Value>) -> Result<&mut Vec<Value>> {
+    obj.get_mut("process")
+        .ok_or_else(|| {
+            Error::new(
+                ExitStatus::DataErr,
+                "Validation error: 'process' doesn't exist",
+            )
+        })?
+        .as_object_mut()
+        .ok_or_else(|| {
+            Error::new(
+                ExitStatus::DataErr,
+                "Validation error: 'process' is not an object",
+            )
+        })?
+        .get_mut("env")
+        .ok_or_else(|| {
+            Error::new(
+                ExitStatus::DataErr,
+                "Validation error: 'process.env' doesn't exist",
+            )
+        })?
+        .as_array_mut()
+        .ok_or_else(|| {
+            Error::new(
+                ExitStatus::DataErr,
+                "Validation error: 'process.env' is not an array",
+            )
+        })
 }
 
 // Precreate takes as stdin the container config json
