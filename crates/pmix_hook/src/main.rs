@@ -6,7 +6,7 @@ use std::{
     fmt,
     io::{self, Read, Write},
     path::PathBuf,
-    process::{self},
+    process,
 };
 
 fn main() {
@@ -96,27 +96,22 @@ fn apply_pmix_updates(obj: &mut Map<String, Value>) -> Result<()> {
     let pmix_found = is_pattern_in_env_keys(&container_env, "PMIX_");
 
     if ((slurm_mpi_type.is_empty()) || slurm_mpi_type.starts_with("pmix")) && pmix_found {
-        let pmix_ptl_module = get_env_entry_str(&container_env, "PMIX_PTL_MODULE");
-        let pmix_mca_ptl = get_env_entry_str(&container_env, "PMIX_MCA_ptl");
+        // UPDATE PMIx environment variables
+        const PMIX_ENV_UPDATES: &[(&str, &str)] = &[
+            ("PMIX_PTL_MODULE", "PMIX_MCA_ptl"),
+            ("PMIX_SECURITY_MODE", "PMIX_MCA_psec"),
+            ("PMIX_GDS_MODULE", "PMIX_MCA_gds"),
+        ];
 
-        if !pmix_ptl_module.is_empty() && pmix_mca_ptl.is_empty() {
-            insert_process_env(obj, "PMIX_MCA_ptl", &pmix_ptl_module)?;
+        for (src, dst) in PMIX_ENV_UPDATES {
+            let src_val = get_env_entry_str(&container_env, src);
+            let dst_val = get_env_entry_str(&container_env, dst);
+            if !src_val.is_empty() && dst_val.is_empty() {
+                insert_process_env(obj, dst, src_val)?;
+            }
         }
 
-        let pmix_security_mode = get_env_entry_str(&container_env, "PMIX_SECURITY_MODE");
-        let pmix_mca_psec = get_env_entry_str(&container_env, "PMIX_MCA_psec");
-
-        if !pmix_security_mode.is_empty() && pmix_mca_psec.is_empty() {
-            insert_process_env(obj, "PMIX_MCA_psec", &pmix_security_mode)?;
-        }
-
-        let pmix_gds_module = get_env_entry_str(&container_env, "PMIX_GDS_MODULE");
-        let pmix_mca_gds = get_env_entry_str(&container_env, "PMIX_MCA_gds");
-
-        if !pmix_gds_module.is_empty() && pmix_mca_gds.is_empty() {
-            insert_process_env(obj, "PMIX_MCA_gds", &pmix_gds_module)?;
-        }
-
+        // UPDATE PMIx mounts
         let pmix_server_tmpdir = get_env_entry_str(&container_env, "PMIX_SERVER_TMPDIR");
         let pmix_system_tmpdir = get_env_entry_str(&container_env, "PMIX_SYSTEM_TMPDIR");
 
@@ -146,18 +141,13 @@ fn get_env_entry_str<'a>(env: &'a HashMap<String, String>, key: &str) -> &'a str
 }
 
 fn is_pattern_in_env_keys<'a>(env: &'a HashMap<String, String>, pattern: &str) -> bool {
-    for (k, _v) in env.iter() {
-        if k.starts_with(pattern) {
-            return true;
-        }
-    }
-    false
+    env.keys().any(|k| k.starts_with(pattern))
 }
 
 fn add_mount(obj: &mut Map<String, Value>, folder: &str) -> Result<()> {
     let opts: Vec<String> = vec!["private", "nosuid", "noexec", "nodev", "rw", "bind"]
-        .iter()
-        .map(|s| s.to_string())
+        .into_iter()
+        .map(String::from)
         .collect();
 
     let new_mount = MountBuilder::default()
@@ -204,10 +194,7 @@ fn insert_process_env(obj: &mut Map<String, Value>, key: &str, value: &str) -> R
             )
         })?;
 
-        let (k, _) = s.split_once('=')
-            .ok_or_else(|| Error::new(ExitStatus::DataErr,
-                    format!("Validation error: 'process.env' array contains an item that doesn't contain '=' separator")))?;
-
+        let (k, _) = parse_env_entry(s)?;
         if k == key {
             *entry = format!("{key}={value}").into();
             found = true;
@@ -234,19 +221,19 @@ fn get_process_env_hashmap(obj: &mut Map<String, Value>) -> Result<HashMap<Strin
             ));
         }
 
-        let (k, v) = match entry.as_str().unwrap().split_once("=") {
-            Some(s) => s,
-            None => {
-                return Err(Error::new(
-                    ExitStatus::DataErr,
-                    "Validation error: 'process.env' array contains an item that doesn't contain '=' separator",
-                ))
-            },
-        };
-
+        let (k, v) = parse_env_entry(entry.as_str().unwrap())?;
         ret.insert(String::from(k), String::from(v));
     }
     Ok(ret)
+}
+
+fn parse_env_entry(entry: &str) -> Result<(&str, &str)> {
+    entry.split_once('=').ok_or_else(|| {
+        Error::new(
+            ExitStatus::DataErr,
+            "Validation error: 'process.env' array contains an item without '=' separator",
+        )
+    })
 }
 
 fn get_process_env_array(obj: &mut Map<String, Value>) -> Result<&mut Vec<Value>> {
@@ -299,5 +286,5 @@ fn ensure_obj<'a>(
     candidate: Option<&'a mut Map<String, Value>>,
     err: &str,
 ) -> Result<&'a mut Map<String, Value>> {
-    candidate.ok_or_else(|| Error::new(ExitStatus::DataErr, format!("Validation error: {err}.")))
+    candidate.ok_or_else(|| Error::new(ExitStatus::DataErr, format!("Validation error: {err}")))
 }
