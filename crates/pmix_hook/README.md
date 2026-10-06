@@ -9,6 +9,14 @@ Add PMIx environment variables and bind mounts to container config, based on SLU
 * Adds environment variables and bind mounts related to PMIx to container config if needed.
 * Pretty-prints output and exits non-zero on validation/parse errors (errors go to `stderr`). 
 
+**Requirements**
+
+* Propagates PMIx_* and SLURM_* variables from slurm job environment into container config, i.e.:
+```console
+$ grep ^env /etc/containers/containers.conf.modules/hpc
+env = ["SLURM_*", "PMIX_*", {append=true}]
+```
+
 ## Usage as a Podman hook
 
 Add a `precreate` hook entry similar to:
