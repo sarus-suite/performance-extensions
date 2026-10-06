@@ -102,6 +102,7 @@ jobs:
             cp target/release/sethomevar        "dist/hooks-${HOOKS_ARCH}/sethomevar"
             cp target/release/mkhomedir         "dist/hooks-${HOOKS_ARCH}/mkhomedir"
             cp target/release/pc_injection_hook "dist/hooks-${HOOKS_ARCH}/pc_injection_hook"
+            cp target/release/pmix_hook         "dist/hooks-${HOOKS_ARCH}/pmix_hook"
 
             ls -lah "dist/hooks-${HOOKS_ARCH}"
             EOF
@@ -135,6 +136,7 @@ jobs:
           test -x "$hooks_dir/sethomevar"
           test -x "$hooks_dir/mkhomedir"
           test -x "$hooks_dir/pc_injection_hook"
+          test -x "$hooks_dir/pmix_hook"
 
           "$sarus_suite_shell" --import-hook-dir "$hooks_dir" -- sarus-suite-check
 
@@ -153,4 +155,5 @@ jobs:
             command -v sethomevar
             command -v mkhomedir
             command -v pc_injection_hook
+            command -v pmix_hook
           '
