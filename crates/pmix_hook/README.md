@@ -44,7 +44,7 @@ category, and escaped error message. They intentionally omit the OCI configurati
 For a rootless invocation, inspect the log with:
 
 ```console
-tail -n 20 "<LOG_ROOT>/precreate-hooks-$(id -u)/sethomevar.log"
+tail -n 20 "<LOG_ROOT>/precreate-hooks-$(id -u)/pmix_hook.log"
 ```
 
 The file has no application-level rotation and may be removed by normal `/tmp` cleanup. This
