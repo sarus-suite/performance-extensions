@@ -4,20 +4,21 @@ use serde_json::{Map, Value};
 use std::{
     env,
     fmt,
-    fs::create_dir,
+    fs::{Permissions, create_dir_all, set_permissions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{self, Command},
 };
+use std::os::unix::fs::{PermissionsExt, chown};
 
 const HOOK_ANNOTATION_KEY: &str = "com.hooks.squashfs_mounts";
 const SQUASHFUSE_ENVVAR: &str = "PARALLAX_MP_SQUASHFUSE_CMD";
 const SQUASHFUSE_FLAG_ENVVAR: &str = "PARALLAX_MP_SQUASHFUSE_FLAG";
-const SQUASHFUSE_UID_ENVVAR: &str = "PARALLAX_MP_UID";
-const SQUASHFUSE_GID_ENVVAR: &str = "PARALLAX_MP_GID";
 const SQUASHFUSE_DEFAULT_CMD: &str = "squashfuse_ll";
 const GRAPHROOT_DIRNAME: &str = "graphroot";
-const INTERMEDIATE_MOUNTPOINT_PREFIX: &str = "squashfs_mount_";
+const INTERMEDIATE_MOUNTPOINT_FOLDER: &str = "squashfs_mounts";
+const INTERMEDIATE_MOUNTPOINT_PREFIX: &str = "mount_";
+const DIR_MODE: u32 = 0o755;
 
 fn main() {
     if let Err(error) = run() {
@@ -139,15 +140,20 @@ fn apply_precreate_updates(obj: &mut Map<String, Value>) -> Result<()> {
         None => String::from(SQUASHFUSE_DEFAULT_CMD),
     };
 
-    let squashfuse_options = get_squashfuse_options();
-
     let graphroot_basedir = get_graphroot_basedir(obj)?;
+
+    let (uid, gid) = get_container_uidgid(obj)?;
+
+    let squashfuse_options = get_squashfuse_options(Some(uid), Some(gid));
+
+    let perms = Permissions::from_mode(DIR_MODE);
 
     for (index, mount_string) in squashfs_mounts.enumerate() {
         let mount = Mount::from_string(mount_string)?;
-        let mountpoint_dirname = format!("{INTERMEDIATE_MOUNTPOINT_PREFIX}{index}");
-        let mountpoint_dirpath = graphroot_basedir.join(PathBuf::from(&mountpoint_dirname));
-        eprintln!("{} - {:?} -> {:?}", index, &mount.source, &mountpoint_dirpath);
+        let mountpoint_relpath = format!("{INTERMEDIATE_MOUNTPOINT_FOLDER}/{INTERMEDIATE_MOUNTPOINT_PREFIX}{index}");
+        let mountpoint_dirpath = graphroot_basedir.join(PathBuf::from(&mountpoint_relpath));
+        //eprintln!("{} - {:?} -> {:?}", index, &mount.source, &mountpoint_dirpath);
+        create_intermediate_mountpoint(&mountpoint_dirpath, uid, gid, perms.clone())?;
         squashfuse_mount(&squashfuse_cmd, &squashfuse_options, &mount.source, &mountpoint_dirpath)?;
         add_bindmount(obj, &mountpoint_dirpath, &mount.target)?;
     };
@@ -162,6 +168,87 @@ fn get_container_status(obj: &mut Map<String, Value>) -> String {
     };
 
     String::from(status)
+}
+
+fn get_container_uidgid(obj: &mut Map<String, Value>) -> Result<(u32, u32)> {
+    let user_obj = obj.get("process")
+        .ok_or_else(|| {
+            Error::new(
+                ExitStatus::DataErr,
+                "Validation error: 'process' doesn't exist",
+            )
+        })?
+        .as_object()
+        .ok_or_else(|| {
+            Error::new(
+                ExitStatus::DataErr,
+                "Validation error: 'process' is not an object",
+            )
+        })?
+        .get("user")
+        .ok_or_else(|| {
+            Error::new(
+                ExitStatus::DataErr,
+                "Validation error: 'user' doesn't exist",
+            )
+        })?
+        .as_object()
+        .ok_or_else(|| {
+            Error::new(
+                ExitStatus::DataErr,
+                "Validation error: 'user' is not an object",
+            )
+        })?;
+
+    let uid_u64: u64 = user_obj.get("uid")
+        .ok_or_else(|| {
+            Error::new(
+                ExitStatus::DataErr,
+                "Validation error: 'uid' doesn't exist",
+            )
+        })?
+        .as_u64()
+        .ok_or_else(|| {
+            Error::new(
+                ExitStatus::DataErr,
+                "Validation error: 'uid' is not an u64",
+            )
+        })?;
+    let uid = match u32::try_from(uid_u64) {
+        Ok(n) => n,
+        Err(_) => {
+            return Err(Error::new(
+                ExitStatus::DataErr,
+                "Validation error: 'uid' cannot be converted to u32",
+            ));
+        },
+    };
+
+    let gid_u64: u64 = user_obj.get("gid")
+        .ok_or_else(|| {
+            Error::new(
+                ExitStatus::DataErr,
+                "Validation error: 'gid' doesn't exist",
+            )
+        })?
+        .as_u64()
+        .ok_or_else(|| {
+            Error::new(
+                ExitStatus::DataErr,
+                "Validation error: 'gid' is not an u64",
+            )
+        })?;
+    let gid = match u32::try_from(gid_u64) {
+        Ok(n) => n,
+        Err(_) => {
+            return Err(Error::new(
+                ExitStatus::DataErr,
+                "Validation error: 'gid' cannot be converted to u32",
+            ));
+        },
+    };
+
+    Ok((uid, gid))
 }
 
 fn get_annotation_option(key: &str, obj: &mut Map<String, Value>) -> Option<String> {
@@ -189,20 +276,21 @@ fn get_squashfuse_from_env() -> Option<String> {
     env::var(SQUASHFUSE_ENVVAR).ok()
 }
 
-fn get_squashfuse_options() -> Vec<String> {
+fn get_squashfuse_options(uid: Option<u32>, gid: Option<u32>) -> Vec<String> {
     let mut options: Vec<String> = vec![];
 
     for opt in env::var(SQUASHFUSE_FLAG_ENVVAR).unwrap_or(String::from("")).split_whitespace() {
         options.push(opt.to_string());
     }
 
-    let uid = env::var(SQUASHFUSE_UID_ENVVAR).ok();
-    let gid = env::var(SQUASHFUSE_GID_ENVVAR).ok();
-
     if uid.is_some() && gid.is_some() {
         let u = uid.unwrap();
         let g = gid.unwrap();
-        options.push(format!("-o uid={u},gid={g}"));
+        //options.push(format!("-o uid={u},gid={g}"));
+        options.push(format!("-o"));
+        options.push(format!("uid={u}"));
+        options.push(format!("-o"));
+        options.push(format!("gid={g}"));
     }
 
     options
@@ -277,14 +365,7 @@ fn get_graphroot_basedir(obj: &mut Map<String, Value>) -> Result<PathBuf> {
     Ok(graphroot_basedir)
 }
 
-fn squashfuse_mount(cmd: &str, options: &Vec<String>, source: &Path, target: &Path) -> Result<()> {
-
-    if ! source.is_file() {
-        return Err(Error::new(
-            ExitStatus::DataErr,
-            format!("Validation error: source {:?} is not a file", source),
-        ));
-    }
+fn create_intermediate_mountpoint(target: &Path, uid: u32, gid:u32, perms: Permissions) -> Result<()> {
 
     if target.exists() {
         return Err(Error::new(
@@ -293,7 +374,19 @@ fn squashfuse_mount(cmd: &str, options: &Vec<String>, source: &Path, target: &Pa
         ));
     } else {
 
-        let basedir = match target.parent() {
+        // First ancestor is INTERMEDIATE_MOUNTPOINT_FOLDER
+        let impf = match target.parent() {
+            Some(p) => p,
+            None => {
+                return Err(Error::new(
+                    ExitStatus::DataErr,
+                    format!("Validation error: intermediate mount point {:?} doesn't have a parent", target),
+                ));
+            },
+        };
+
+        // Second ancestor is graphroot
+        let basedir = match impf.parent() {
             Some(p) => p,
             None => {
                 return Err(Error::new(
@@ -310,13 +403,57 @@ fn squashfuse_mount(cmd: &str, options: &Vec<String>, source: &Path, target: &Pa
             ));
         }
 
-        let _ = create_dir(target).map_err(|_| {
+        let _ = create_dir_all(target).map_err(|_| {
             return Err::<(), Error>(Error::new(
                 ExitStatus::DataErr,
-                format!("Validation error: cannot create directory: {:?}", target),
+                format!("Validation error: cannot create directory at: {:?}", target),
             ));
         });
-           
+
+        for path in vec![impf, target, basedir] {
+            match set_permissions(&path, perms.clone()) {
+                Ok(_) => {},
+                Err(_) => {
+                    return Err::<(), Error>(Error::new(
+                        ExitStatus::DataErr,
+                        format!("Validation error: cannot set permissions for directory at: {:?}", path),
+                    ));
+                },
+            };
+            match chown(&path, Some(uid), Some(gid)) {
+                Ok(_) => {},
+                Err(_) => {
+                    return Err::<(), Error>(Error::new(
+                        ExitStatus::DataErr,
+                        format!("Validation error: cannot set ownership for directory at: {:?}", path),
+                    ));
+                },
+            };
+        }
+    }
+    Ok(())
+
+}
+
+fn squashfuse_mount(cmd: &str, options: &Vec<String>, source: &Path, target: &Path) -> Result<()> {
+
+    if ! source.is_file() {
+        return Err(Error::new(
+            ExitStatus::DataErr,
+            format!("Validation error: source {:?} is not a file", source),
+        ));
+    }
+
+    if !target.exists() {
+        return Err(Error::new(
+            ExitStatus::DataErr,
+            format!("Validation error: intermediate mount folder {:?} doesn't exist", target),
+        ));
+    }
+
+    let mut options_str = String::from("");
+    for o in options {
+        options_str = format!("{options_str} {o}");
     }
 
     let output = Command::new(cmd)
