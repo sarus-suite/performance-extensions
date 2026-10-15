@@ -1,23 +1,19 @@
-use oci_spec::runtime::MountBuilder;
 use precreate_hook_diagnostics::{write_error, ExitStatus};
 use serde_json::{Map, Value};
 use std::{
-    env,
+    env::var,
     fmt,
-    fs::{Permissions, create_dir_all, set_permissions},
-    io::{self, Read, Write},
+    ffi::OsString,
+    fs::{Permissions, create_dir, read_to_string, set_permissions},
+    io::{self, Read},
     path::{Path, PathBuf},
     process::{self, Command},
+    os::unix::fs::{PermissionsExt, chown},
 };
-use std::os::unix::fs::{PermissionsExt, chown};
 
 const HOOK_ANNOTATION_KEY: &str = "com.hooks.squashfs_mounts";
-const SQUASHFUSE_ENVVAR: &str = "PARALLAX_MP_SQUASHFUSE_CMD";
-const SQUASHFUSE_FLAG_ENVVAR: &str = "PARALLAX_MP_SQUASHFUSE_FLAG";
 const SQUASHFUSE_DEFAULT_CMD: &str = "squashfuse_ll";
-const GRAPHROOT_DIRNAME: &str = "graphroot";
-const INTERMEDIATE_MOUNTPOINT_FOLDER: &str = "squashfs_mounts";
-const INTERMEDIATE_MOUNTPOINT_PREFIX: &str = "mount_";
+const SQUASHFUSE_ENVVAR: &str = "PARALLAX_MP_SQUASHFUSE_CMD";
 const DIR_MODE: u32 = 0o755;
 
 fn main() {
@@ -88,45 +84,19 @@ impl Mount {
 fn run() -> Result<()> {
     let mut value = read_stdin_json()?;
     let obj = ensure_obj(value.as_object_mut(), "top-level JSON must be an object")?;
-    apply_updates(obj)?;
-    write_stdout_json(&value)?;
+    do_hook(obj)?;
     Ok(())
 }
 
-// Pretty-print output JSON with trailing newline
-fn write_stdout_json(value: &Value) -> Result<()> {
-    let mut stdout = io::stdout().lock();
-
-    serde_json::to_writer_pretty(&mut stdout, value).map_err(|e| {
-        Error::new(
-            ExitStatus::Software,
-            format!("Failed to write JSON to stdout: {e}"),
-        )
-    })?;
-
-    stdout.write_all(b"\n").map_err(|e| {
-        Error::new(
-            ExitStatus::IoErr,
-            format!("Failed to write newline to stdout: {e}"),
-        )
-    })?;
-
-    stdout
-        .flush()
-        .map_err(|e| Error::new(ExitStatus::IoErr, format!("Failed to flush stdout: {e}")))?;
-
-    Ok(())
-}
-
-fn apply_updates(obj: &mut Map<String, Value>) -> Result<()> {
+fn do_hook(obj: &mut Map<String, Value>) -> Result<()> {
     let status = get_container_status(obj);
     match status.as_str() {
-        "stopped" => apply_poststop_updates(obj),
-        &_ => apply_precreate_updates(obj),
+        "created" => do_create_container_hook(obj),
+        &_ => Ok(()),
     }
 }
 
-fn apply_precreate_updates(obj: &mut Map<String, Value>) -> Result<()> {
+fn do_create_container_hook(obj: &mut Map<String, Value>) -> Result<()> {
 
     let squashfs_mounts_string = match get_annotation_option(HOOK_ANNOTATION_KEY, obj) {
         Some(s) => s,
@@ -135,30 +105,29 @@ fn apply_precreate_updates(obj: &mut Map<String, Value>) -> Result<()> {
 
     let squashfs_mounts = squashfs_mounts_string.split(";");
 
-    let squashfuse_cmd = match get_squashfuse_from_env() {
-        Some(s) => s,
-        None => String::from(SQUASHFUSE_DEFAULT_CMD),
-    };
-
-    let graphroot_basedir = get_graphroot_basedir(obj)?;
-
-    let (uid, gid) = get_container_uidgid(obj)?;
-
-    let squashfuse_options = get_squashfuse_options(Some(uid), Some(gid));
+    let rootfs_dirpath = get_container_rootfs_path(obj)?;
 
     let perms = Permissions::from_mode(DIR_MODE);
+    let config = get_container_config(obj)?;
+    let uid = get_container_uid(&config)?;
+    let gid = get_container_gid(&config)?;
 
-    for (index, mount_string) in squashfs_mounts.enumerate() {
+    for mount_string in squashfs_mounts {
         let mount = Mount::from_string(mount_string)?;
-        let mountpoint_relpath = format!("{INTERMEDIATE_MOUNTPOINT_FOLDER}/{INTERMEDIATE_MOUNTPOINT_PREFIX}{index}");
-        let mountpoint_dirpath = graphroot_basedir.join(PathBuf::from(&mountpoint_relpath));
-        //eprintln!("{} - {:?} -> {:?}", index, &mount.source, &mountpoint_dirpath);
-        create_intermediate_mountpoint(&mountpoint_dirpath, uid, gid, perms.clone())?;
-        squashfuse_mount(&squashfuse_cmd, &squashfuse_options, &mount.source, &mountpoint_dirpath)?;
-        add_bindmount(obj, &mountpoint_dirpath, &mount.target)?;
+        let mount_target_relpath = pb_trim_root(PathBuf::from(&mount.target));
+        let mountpoint_dirpath = rootfs_dirpath.join(mount_target_relpath);
+        create_directory_tree(&mountpoint_dirpath, uid, gid, &perms)?;
+        squashfuse_mount(&mount.source, &mountpoint_dirpath)?;
     };
 
     Ok(())
+}
+
+fn pb_trim_root(pb: PathBuf) -> PathBuf {
+    match pb.strip_prefix("/") {
+        Ok(p) => p.to_path_buf(),
+        Err(_) => pb,
+    }
 }
 
 fn get_container_status(obj: &mut Map<String, Value>) -> String {
@@ -170,7 +139,58 @@ fn get_container_status(obj: &mut Map<String, Value>) -> String {
     String::from(status)
 }
 
-fn get_container_uidgid(obj: &mut Map<String, Value>) -> Result<(u32, u32)> {
+fn get_container_rootfs_path(obj: &mut Map<String, Value>) -> Result<PathBuf> {
+    let rootfs = obj.get("root")
+        .ok_or_else(|| {
+            Error::new(
+                ExitStatus::DataErr,
+                "Validation error: 'root' doesn't exist",
+            )
+        })?
+        .as_str()
+        .ok_or_else(|| {
+            Error::new(
+                ExitStatus::DataErr,
+                "Validation error: 'root' is not a string",
+            )
+        })?;
+
+    Ok(PathBuf::from(rootfs))
+}
+
+fn get_container_bundle(obj: &mut Map<String, Value>) -> Result<PathBuf> {
+    let bundle = obj.get("bundle")
+        .ok_or_else(|| {
+            Error::new(
+                ExitStatus::DataErr,
+                "Validation error: 'bundle' doesn't exist",
+            )
+        })?
+        .as_str()
+        .ok_or_else(|| {
+            Error::new(
+                ExitStatus::DataErr,
+                "Validation error: 'bundle' is not a string",
+            )
+        })?;
+
+    Ok(PathBuf::from(bundle))
+}
+
+fn get_container_config(obj: &mut Map<String, Value>) -> Result<Map<String, Value>> {
+    let bundle = get_container_bundle(obj)?;
+    let config_file = bundle.join(PathBuf::from("config.json"));
+    let config_str = read_to_string(config_file)
+                        .map_err(|e| Error::new(ExitStatus::IoErr, format!("Failed to read from file: {e}")))?;
+    let mut config_value: Value = serde_json::from_str(&config_str)
+        .map_err(|e| Error::new(ExitStatus::DataErr, format!("Invalid Config JSON: {e}")))?;
+    let config_obj = ensure_obj(config_value.as_object_mut(), "Unable to find root object in Config JSON")?.clone();
+
+    Ok(config_obj)
+}
+
+fn get_container_user(obj: &Map<String, Value>) -> Result<&Map<String, Value>> {
+
     let user_obj = obj.get("process")
         .ok_or_else(|| {
             Error::new(
@@ -199,6 +219,11 @@ fn get_container_uidgid(obj: &mut Map<String, Value>) -> Result<(u32, u32)> {
                 "Validation error: 'user' is not an object",
             )
         })?;
+    Ok(user_obj)
+}
+
+fn get_container_uid(obj: &Map<String, Value>) -> Result<u32> {
+    let user_obj = get_container_user(obj)?;
 
     let uid_u64: u64 = user_obj.get("uid")
         .ok_or_else(|| {
@@ -223,6 +248,11 @@ fn get_container_uidgid(obj: &mut Map<String, Value>) -> Result<(u32, u32)> {
             ));
         },
     };
+    Ok(uid)
+}
+
+fn get_container_gid(obj: &Map<String, Value>) -> Result<u32> {
+    let user_obj = get_container_user(obj)?;
 
     let gid_u64: u64 = user_obj.get("gid")
         .ok_or_else(|| {
@@ -247,8 +277,7 @@ fn get_container_uidgid(obj: &mut Map<String, Value>) -> Result<(u32, u32)> {
             ));
         },
     };
-
-    Ok((uid, gid))
+    Ok(gid)
 }
 
 fn get_annotation_option(key: &str, obj: &mut Map<String, Value>) -> Option<String> {
@@ -273,169 +302,18 @@ fn get_annotation_option(key: &str, obj: &mut Map<String, Value>) -> Option<Stri
 }
 
 fn get_squashfuse_from_env() -> Option<String> {
-    env::var(SQUASHFUSE_ENVVAR).ok()
+    var(SQUASHFUSE_ENVVAR).ok()
 }
 
-fn get_squashfuse_options(uid: Option<u32>, gid: Option<u32>) -> Vec<String> {
+fn get_squashfuse_options() -> Vec<String> {
     let mut options: Vec<String> = vec![];
 
-    for opt in env::var(SQUASHFUSE_FLAG_ENVVAR).unwrap_or(String::from("")).split_whitespace() {
-        options.push(opt.to_string());
-    }
-
-    if uid.is_some() && gid.is_some() {
-        let u = uid.unwrap();
-        let g = gid.unwrap();
-        //options.push(format!("-o uid={u},gid={g}"));
-        options.push(format!("-o"));
-        options.push(format!("uid={u}"));
-        options.push(format!("-o"));
-        options.push(format!("gid={g}"));
-    }
-
+    options.push(format!("-o"));
+    options.push(format!("allow_other"));
     options
 }
 
-fn get_graphroot_basedir(obj: &mut Map<String, Value>) -> Result<PathBuf> {
-    let rootpath_string = obj.get("root")
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'root' doesn't exist",
-            )
-        })?
-        .as_object()
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'root' is not an object",
-            )
-        })?
-        .get("path")
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'path' doesn't exist",
-            )
-        })?
-        .as_str()
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'path' is not a string",
-            )
-        })?;
-
-    // /dev/shm/skybox_7210.0/graphroot/overlay/ca2fdb40f38090441ba6b6fac508812276cba66cdc1465fc96d33d44d3d1e065/merged"
-    let rootpath = PathBuf::from(rootpath_string);
-    
-    let mut graphroot_basedir = PathBuf::from("/");
-
-    for a in rootpath.ancestors() {
-        let filename = match a.file_name() {
-            Some(os) => os,
-            None => {
-                return Err(Error::new(
-                    ExitStatus::DataErr,
-                    "Validation error: filename not found",
-                ));
-            },
-        };
-        if filename == GRAPHROOT_DIRNAME {
-            graphroot_basedir = match a.parent() {
-                Some(p) => p.to_path_buf(),
-                None => {
-                    return Err(Error::new(
-                        ExitStatus::DataErr,
-                        "Validation error: 'graphroot' should have a parent directory",
-                    ));
-                },
-            };
-            break;
-        }
-    }
-
-    if graphroot_basedir == PathBuf::from("/") {
-        return Err(Error::new(
-            ExitStatus::DataErr,
-            "Validation error: cannot find graphroot base directory",
-        ));
-    }
-
-    Ok(graphroot_basedir)
-}
-
-fn create_intermediate_mountpoint(target: &Path, uid: u32, gid:u32, perms: Permissions) -> Result<()> {
-
-    if target.exists() {
-        return Err(Error::new(
-            ExitStatus::DataErr,
-            format!("Validation error: intermediate mount folder {:?} already exists", target),
-        ));
-    } else {
-
-        // First ancestor is INTERMEDIATE_MOUNTPOINT_FOLDER
-        let impf = match target.parent() {
-            Some(p) => p,
-            None => {
-                return Err(Error::new(
-                    ExitStatus::DataErr,
-                    format!("Validation error: intermediate mount point {:?} doesn't have a parent", target),
-                ));
-            },
-        };
-
-        // Second ancestor is graphroot
-        let basedir = match impf.parent() {
-            Some(p) => p,
-            None => {
-                return Err(Error::new(
-                    ExitStatus::DataErr,
-                    format!("Validation error: intermediate mount folder {:?} doesn't have a parent", target),
-                ));
-            },
-        };
-
-        if !basedir.exists() {
-            return Err(Error::new(
-                ExitStatus::DataErr,
-                format!("Validation error: cannot create intermediate folder because base directory {:?} doesn't exists", basedir),
-            ));
-        }
-
-        let _ = create_dir_all(target).map_err(|_| {
-            return Err::<(), Error>(Error::new(
-                ExitStatus::DataErr,
-                format!("Validation error: cannot create directory at: {:?}", target),
-            ));
-        });
-
-        for path in vec![impf, target, basedir] {
-            match set_permissions(&path, perms.clone()) {
-                Ok(_) => {},
-                Err(_) => {
-                    return Err::<(), Error>(Error::new(
-                        ExitStatus::DataErr,
-                        format!("Validation error: cannot set permissions for directory at: {:?}", path),
-                    ));
-                },
-            };
-            match chown(&path, Some(uid), Some(gid)) {
-                Ok(_) => {},
-                Err(_) => {
-                    return Err::<(), Error>(Error::new(
-                        ExitStatus::DataErr,
-                        format!("Validation error: cannot set ownership for directory at: {:?}", path),
-                    ));
-                },
-            };
-        }
-    }
-    Ok(())
-
-}
-
-fn squashfuse_mount(cmd: &str, options: &Vec<String>, source: &Path, target: &Path) -> Result<()> {
+fn squashfuse_mount(source: &Path, target: &Path) -> Result<()> {
 
     if ! source.is_file() {
         return Err(Error::new(
@@ -447,17 +325,33 @@ fn squashfuse_mount(cmd: &str, options: &Vec<String>, source: &Path, target: &Pa
     if !target.exists() {
         return Err(Error::new(
             ExitStatus::DataErr,
-            format!("Validation error: intermediate mount folder {:?} doesn't exist", target),
+            format!("Validation error: target folder {:?} doesn't exist", target),
         ));
     }
 
-    let mut options_str = String::from("");
-    for o in options {
-        options_str = format!("{options_str} {o}");
+    if !target.is_dir() {
+        return Err(Error::new(
+            ExitStatus::DataErr,
+            format!("Validation error: target folder {:?} is not a directory", target),
+        ));
+    }
+
+    let cmd = match get_squashfuse_from_env() {
+        Some(s) => s,
+        None => String::from(SQUASHFUSE_DEFAULT_CMD),
+    };
+
+    let options = get_squashfuse_options();
+
+    let mut additional_options: Vec<String> = vec![];
+    if !is_empty_directory(target) {
+        additional_options.push(format!("-o"));
+        additional_options.push(format!("nonempty"));
     }
 
     let output = Command::new(cmd)
         .args(options)
+        .args(additional_options)
         .arg(source)
         .arg(target)
         .output()
@@ -476,160 +370,83 @@ fn squashfuse_mount(cmd: &str, options: &Vec<String>, source: &Path, target: &Pa
         ));
     }
     Ok(())
-
-}
-/*
-fn get_env_entry_str<'a>(env: &'a HashMap<String, String>, key: &str) -> &'a str {
-    env.get(key).map(|s| s.as_str()).unwrap_or("")
 }
 
-fn is_pattern_in_env_keys<'a>(env: &'a HashMap<String, String>, pattern: &str) -> bool {
-    env.keys().any(|k| k.starts_with(pattern))
-}
-*/
 
-fn add_bindmount(obj: &mut Map<String, Value>, source: &Path, target: &Path) -> Result<()> {
-    let opts: Vec<String> = vec!["private", "nosuid", "nodev", "ro", "bind"]
-        .into_iter()
-        .map(String::from)
-        .collect();
-
-    let source_str = source.to_str()
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                format!("Validation error: source cannot be converted to string"),
-            )
-        }).unwrap();
-
-    let target_str = target.to_str()
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                format!("Validation error: target cannot be converted to string"),
-            )
-        }).unwrap();
-
-    let new_mount = MountBuilder::default()
-        .typ("bind")
-        .options(opts)
-        .source(source_str)
-        .destination(target_str)
-        .build()
-        .map_err(|e| Error::new(ExitStatus::DataErr, format!("invalid new mount: {e}")))?;
-
-    let new_mount_value = serde_json::to_value(new_mount).map_err(|e| {
-        Error::new(
-            ExitStatus::DataErr,
-            format!("unable to serialize new mount: {e}"),
-        )
-    })?;
-
-    match obj.get_mut("mounts") {
-        Some(Value::Array(arr)) => arr.push(new_mount_value),
-        Some(_) => {
-            return Err(Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'mounts' is not an array",
-            ))
-        }
-        None => {
-            obj.insert("mounts".to_string(), Value::Array(vec![new_mount_value]));
-        }
-    }
-    Ok(())
-}
-/*
-fn insert_process_env(obj: &mut Map<String, Value>, key: &str, value: &str) -> Result<()> {
-    let env_array = get_process_env_array(obj)?;
-
-    let mut found = false;
-    for entry in env_array.iter_mut() {
-        let s = entry.as_str().ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                format!(
-                    "Validation error: 'process.env' array contains an item that is not a string"
-                ),
-            )
-        })?;
-
-        let (k, _) = parse_env_entry(s)?;
-        if k == key {
-            *entry = format!("{key}={value}").into();
-            found = true;
-            break;
-        }
+fn create_directory_tree(path: &Path, uid: u32, gid:u32, perms: &Permissions) -> Result<()> {
+    if path.exists() {
+        return Ok(());
     }
 
-    if !found {
-        env_array.push(format!("{key}={value}").into());
-    }
-    Ok(())
-}
+    let mut tree_stack: Vec<OsString> = vec![];
+    let mut folder = path.to_path_buf();
 
-fn get_process_env_hashmap(obj: &mut Map<String, Value>) -> Result<HashMap<String, String>> {
-    let env_array = get_process_env_array(obj)?;
+    while !folder.exists() {
+        let dirname = match folder.file_name() {
+            Some(name) => name.to_os_string(),
+            None => {
+                return Err(Error::new(
+                    ExitStatus::DataErr,
+                    format!("Validation error: unexpected missing directory name for {:?}", folder),
+                ));
+            },
+        };
+        tree_stack.push(dirname);
 
-    let mut ret = HashMap::new();
+        folder = match folder.parent() {
+            Some(parent) => parent.to_path_buf(),
+            None => {
+                return Err(Error::new(
+                    ExitStatus::DataErr,
+                    format!("Validation error: unexpected missing parent for {:?}", folder),
+                ));
+            },
+        };
+    };
 
-    for entry in env_array.iter() {
-        if !entry.is_string() {
-            return Err(Error::new(
+    let mut d = tree_stack.pop();
+
+    while d.is_some() {
+        let dirname = d.unwrap();
+        folder = folder.join(PathBuf::from(dirname));
+        let _ = create_dir(&folder).map_err(|_| {
+            return Err::<(), Error>(Error::new(
                 ExitStatus::DataErr,
-                "Validation error: 'process.env' array contains an item that is not a string",
+                format!("Validation error: cannot create directory at: {:?}", folder),
             ));
-        }
+        });
 
-        let (k, v) = parse_env_entry(entry.as_str().unwrap())?;
-        ret.insert(String::from(k), String::from(v));
-    }
-    Ok(ret)
-}
+        match set_permissions(&folder, perms.clone()) {
+            Ok(_) => {},
+            Err(_) => {
+                return Err::<(), Error>(Error::new(
+                    ExitStatus::DataErr,
+                    format!("Validation error: cannot set permissions for directory at: {:?}", folder),
+                ));
+            },
+        };
 
-fn parse_env_entry(entry: &str) -> Result<(&str, &str)> {
-    entry.split_once('=').ok_or_else(|| {
-        Error::new(
-            ExitStatus::DataErr,
-            "Validation error: 'process.env' array contains an item without '=' separator",
-        )
-    })
-}
+        match chown(&folder, Some(uid), Some(gid)) {
+            Ok(_) => {},
+            Err(_) => {
+                return Err::<(), Error>(Error::new(
+                    ExitStatus::DataErr,
+                    format!("Validation error: cannot set ownership for directory at: {:?}", folder),
+                ));
+            },
+        };
 
-fn get_process_env_array(obj: &mut Map<String, Value>) -> Result<&mut Vec<Value>> {
-    obj.get_mut("process")
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'process' doesn't exist",
-            )
-        })?
-        .as_object_mut()
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'process' is not an object",
-            )
-        })?
-        .get_mut("env")
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'process.env' doesn't exist",
-            )
-        })?
-        .as_array_mut()
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'process.env' is not an array",
-            )
-        })
-}
-*/
-
-fn apply_poststop_updates(obj: &mut Map<String, Value>) -> Result<()> {
+        d = tree_stack.pop();
+    };
     Ok(())
+}
+
+fn is_empty_directory(path: &Path) -> bool {
+
+    match path.read_dir() {
+        Ok(mut content) => content.next().is_none(),
+        Err(_) => false,
+    }
 }
 
 // Precreate takes as stdin the container config json
