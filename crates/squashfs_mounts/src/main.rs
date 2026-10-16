@@ -2,13 +2,13 @@ use precreate_hook_diagnostics::{write_error, ExitStatus};
 use serde_json::{Map, Value};
 use std::{
     env::var,
-    fmt,
     ffi::OsString,
-    fs::{Permissions, create_dir, read_to_string, set_permissions},
+    fmt,
+    fs::{create_dir, read_to_string, set_permissions, Permissions},
     io::{self, Read},
+    os::unix::fs::{chown, PermissionsExt},
     path::{Path, PathBuf},
     process::{self, Command},
-    os::unix::fs::{PermissionsExt, chown},
 };
 
 const HOOK_ANNOTATION_KEY: &str = "com.hooks.squashfs_mounts";
@@ -19,7 +19,9 @@ const DIR_MODE: u32 = 0o755;
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error}");
-        if let Err(log_error) = write_error("squashfs_mounts", error.exit_status(), &error.to_string()) {
+        if let Err(log_error) =
+            write_error("squashfs_mounts", error.exit_status(), &error.to_string())
+        {
             eprintln!("squashfs_mounts: failed to write diagnostic log: {log_error}");
         }
         process::exit(error.exit_status().code());
@@ -62,22 +64,18 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Mount {
-
     pub fn from_string(input: &str) -> Result<Mount> {
-        let (source, target) = input.split_once(':')
-            .ok_or_else(|| {
-                Error::new(
-                    ExitStatus::DataErr,
-                    &format!("Validation error: invalid squashfs mount format for \"{input}\""),
-                )
-            })?;
+        let (source, target) = input.split_once(':').ok_or_else(|| {
+            Error::new(
+                ExitStatus::DataErr,
+                &format!("Validation error: invalid squashfs mount format for \"{input}\""),
+            )
+        })?;
 
-        Ok(
-            Mount {
-                source: PathBuf::from(source),
-                target: PathBuf::from(target),
-            }
-        )
+        Ok(Mount {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+        })
     }
 }
 
@@ -97,7 +95,6 @@ fn do_hook(obj: &Map<String, Value>) -> Result<()> {
 }
 
 fn do_create_container_hook(obj: &Map<String, Value>) -> Result<()> {
-
     let squashfs_mounts_string = match get_annotation_option(HOOK_ANNOTATION_KEY, obj) {
         Some(s) => s,
         None => return Ok(()),
@@ -109,8 +106,9 @@ fn do_create_container_hook(obj: &Map<String, Value>) -> Result<()> {
 
     let perms = Permissions::from_mode(DIR_MODE);
     let config = get_container_config(obj)?;
-    let uid = get_container_uid(&config)?;
-    let gid = get_container_gid(&config)?;
+    let user_obj = get_config_user(&config)?;
+    let uid = get_config_user_uid(&user_obj)?;
+    let gid = get_config_user_gid(&user_obj)?;
 
     for mount_string in squashfs_mounts {
         let mount = Mount::from_string(mount_string)?;
@@ -118,7 +116,7 @@ fn do_create_container_hook(obj: &Map<String, Value>) -> Result<()> {
         let mountpoint_dirpath = rootfs_dirpath.join(mount_target_relpath);
         create_directory_tree(&mountpoint_dirpath, uid, gid, &perms)?;
         squashfuse_mount(&mount.source, &mountpoint_dirpath)?;
-    };
+    }
 
     Ok(())
 }
@@ -153,34 +151,35 @@ fn get_container_config(obj: &Map<String, Value>) -> Result<Map<String, Value>> 
     let bundle = get_container_bundle(obj)?;
     let config_file = bundle.join(PathBuf::from("config.json"));
     let config_str = read_to_string(config_file)
-                        .map_err(|e| Error::new(ExitStatus::IoErr, format!("Failed to read from file: {e}")))?;
+        .map_err(|e| Error::new(ExitStatus::IoErr, format!("Failed to read from file: {e}")))?;
     let config_value: Value = serde_json::from_str(&config_str)
         .map_err(|e| Error::new(ExitStatus::DataErr, format!("Invalid Config JSON: {e}")))?;
-    let config_obj = ensure_obj(config_value.as_object(), "Unable to find root object in Config JSON")?.clone();
+    let config_obj = ensure_obj(
+        config_value.as_object(),
+        "Unable to find root object in Config JSON",
+    )?
+    .clone();
 
     Ok(config_obj)
 }
 
-fn get_container_user(obj: &Map<String, Value>) -> Result<&Map<String, Value>> {
-    let process_obj = get_json_obj_key_object(obj, "process")?;
+fn get_config_user(config_obj: &Map<String, Value>) -> Result<&Map<String, Value>> {
+    let process_obj = get_json_obj_key_object(config_obj, "process")?;
     let user_obj = get_json_obj_key_object(process_obj, "user")?;
     Ok(user_obj)
 }
 
-fn get_container_uid(obj: &Map<String, Value>) -> Result<u32> {
-    let user_obj = get_container_user(obj)?;
+fn get_config_user_uid(user_obj: &Map<String, Value>) -> Result<u32> {
     let uid = get_json_obj_key_u32(user_obj, "uid")?;
     Ok(uid)
 }
 
-fn get_container_gid(obj: &Map<String, Value>) -> Result<u32> {
-    let user_obj = get_container_user(obj)?;
+fn get_config_user_gid(user_obj: &Map<String, Value>) -> Result<u32> {
     let gid = get_json_obj_key_u32(user_obj, "gid")?;
     Ok(gid)
 }
 
 fn get_annotation_option(key: &str, obj: &Map<String, Value>) -> Option<String> {
-
     let annotation_obj = match get_json_obj_key_object(obj, "annotations") {
         Ok(o) => o,
         Err(_) => return None,
@@ -207,25 +206,27 @@ fn get_squashfuse_options() -> Vec<String> {
 }
 
 fn squashfuse_mount(source: &Path, target: &Path) -> Result<()> {
-
-    if ! source.is_file() {
+    if !source.is_file() {
         return Err(Error::new(
-            ExitStatus::DataErr,
+            ExitStatus::Unavailable,
             format!("Validation error: source {:?} is not a file", source),
         ));
     }
 
     if !target.exists() {
         return Err(Error::new(
-            ExitStatus::DataErr,
+            ExitStatus::Unavailable,
             format!("Validation error: target folder {:?} doesn't exist", target),
         ));
     }
 
     if !target.is_dir() {
         return Err(Error::new(
-            ExitStatus::DataErr,
-            format!("Validation error: target folder {:?} is not a directory", target),
+            ExitStatus::Unavailable,
+            format!(
+                "Validation error: target folder {:?} is not a directory",
+                target
+            ),
         ));
     }
 
@@ -250,23 +251,22 @@ fn squashfuse_mount(source: &Path, target: &Path) -> Result<()> {
         .output()
         .map_err(|_| {
             return Err::<(), Error>(Error::new(
-                ExitStatus::DataErr,
-                "Validation error: cannot spawn squashfuse mount process",
+                ExitStatus::IoErr,
+                "Error: cannot spawn squashfuse mount process",
             ));
         })
         .unwrap();
 
     if !output.status.success() {
         return Err(Error::new(
-            ExitStatus::DataErr,
-            "Validation error: squashfuse mount failed",
+            ExitStatus::IoErr,
+            "Error: squashfuse mount failed",
         ));
     }
     Ok(())
 }
 
-
-fn create_directory_tree(path: &Path, uid: u32, gid:u32, perms: &Permissions) -> Result<()> {
+fn create_directory_tree(path: &Path, uid: u32, gid: u32, perms: &Permissions) -> Result<()> {
     if path.exists() {
         return Ok(());
     }
@@ -280,9 +280,12 @@ fn create_directory_tree(path: &Path, uid: u32, gid:u32, perms: &Permissions) ->
             None => {
                 return Err(Error::new(
                     ExitStatus::DataErr,
-                    format!("Validation error: unexpected missing directory name for {:?}", folder),
+                    format!(
+                        "Validation error: unexpected missing directory name for {:?}",
+                        folder
+                    ),
                 ));
-            },
+            }
         };
         tree_stack.push(dirname);
 
@@ -291,11 +294,14 @@ fn create_directory_tree(path: &Path, uid: u32, gid:u32, perms: &Permissions) ->
             None => {
                 return Err(Error::new(
                     ExitStatus::DataErr,
-                    format!("Validation error: unexpected missing parent for {:?}", folder),
+                    format!(
+                        "Validation error: unexpected missing parent for {:?}",
+                        folder
+                    ),
                 ));
-            },
+            }
         };
-    };
+    }
 
     let mut d = tree_stack.pop();
 
@@ -304,38 +310,40 @@ fn create_directory_tree(path: &Path, uid: u32, gid:u32, perms: &Permissions) ->
         folder = folder.join(PathBuf::from(dirname));
         let _ = create_dir(&folder).map_err(|_| {
             return Err::<(), Error>(Error::new(
-                ExitStatus::DataErr,
-                format!("Validation error: cannot create directory at: {:?}", folder),
+                ExitStatus::IoErr,
+                format!("Error: cannot create directory at: {:?}", folder),
             ));
         });
 
         match set_permissions(&folder, perms.clone()) {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(_) => {
                 return Err::<(), Error>(Error::new(
-                    ExitStatus::DataErr,
-                    format!("Validation error: cannot set permissions for directory at: {:?}", folder),
+                    ExitStatus::IoErr,
+                    format!(
+                        "Error: cannot set permissions for directory at: {:?}",
+                        folder
+                    ),
                 ));
-            },
+            }
         };
 
         match chown(&folder, Some(uid), Some(gid)) {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(_) => {
                 return Err::<(), Error>(Error::new(
-                    ExitStatus::DataErr,
-                    format!("Validation error: cannot set ownership for directory at: {:?}", folder),
+                    ExitStatus::IoErr,
+                    format!("Error: cannot set ownership for directory at: {:?}", folder),
                 ));
-            },
+            }
         };
 
         d = tree_stack.pop();
-    };
+    }
     Ok(())
 }
 
 fn is_empty_directory(path: &Path) -> bool {
-
     match path.read_dir() {
         Ok(mut content) => content.next().is_none(),
         Err(_) => false,
@@ -348,7 +356,10 @@ fn get_json_obj_key_string(obj: &Map<String, Value>, key: &str) -> Result<String
     Ok(String::from(string))
 }
 
-fn get_json_obj_key_object<'a>(obj: &'a Map<String, Value>, key: &'a str) -> Result<&'a Map<String, Value>> {
+fn get_json_obj_key_object<'a>(
+    obj: &'a Map<String, Value>,
+    key: &'a str,
+) -> Result<&'a Map<String, Value>> {
     let value = get_json_obj_key_value(obj, key)?;
     let object = get_json_value_as_object(value, key)?;
     Ok(object)
@@ -361,52 +372,45 @@ fn get_json_obj_key_u32(obj: &Map<String, Value>, key: &str) -> Result<u32> {
 }
 
 fn get_json_obj_key_value<'a>(obj: &'a Map<String, Value>, key: &'a str) -> Result<&'a Value> {
-    let value = obj.get(key)
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                format!("Validation error: '{key}' doesn't exist"),
-            )
-        })?;
+    let value = obj.get(key).ok_or_else(|| {
+        Error::new(
+            ExitStatus::DataErr,
+            format!("Validation error: '{key}' doesn't exist"),
+        )
+    })?;
 
     Ok(value)
 }
 
 fn get_json_value_as_string(value: &Value, key: &str) -> Result<String> {
-    let string = value
-        .as_str()
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                format!("Validation error: '{key}' is not a string"),
-            )
-        })?;
+    let string = value.as_str().ok_or_else(|| {
+        Error::new(
+            ExitStatus::DataErr,
+            format!("Validation error: '{key}' is not a string"),
+        )
+    })?;
 
     Ok(String::from(string))
 }
 
 fn get_json_value_as_object<'a>(value: &'a Value, key: &'a str) -> Result<&'a Map<String, Value>> {
-    let obj = value
-        .as_object()
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                format!("Validation error: '{key}' is not an object"),
-            )
-        })?;
+    let obj = value.as_object().ok_or_else(|| {
+        Error::new(
+            ExitStatus::DataErr,
+            format!("Validation error: '{key}' is not an object"),
+        )
+    })?;
 
     Ok(obj)
 }
 
 fn get_json_value_as_u32(value: &Value, key: &str) -> Result<u32> {
-    let num_u64 = value
-        .as_u64()
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                format!("Validation error: '{key}' is not an u64 number"),
-            )
-        })?;
+    let num_u64 = value.as_u64().ok_or_else(|| {
+        Error::new(
+            ExitStatus::DataErr,
+            format!("Validation error: '{key}' is not an u64 number"),
+        )
+    })?;
     let num_u32 = match u32::try_from(num_u64) {
         Ok(n) => n,
         Err(_) => {
@@ -414,7 +418,7 @@ fn get_json_value_as_u32(value: &Value, key: &str) -> Result<u32> {
                 ExitStatus::DataErr,
                 format!("Validation error: '{key}' cannot be converted to u32"),
             ));
-        },
+        }
     };
 
     Ok(num_u32)
