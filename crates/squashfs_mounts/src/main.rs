@@ -141,43 +141,11 @@ fn get_container_status(obj: &Map<String, Value>) -> String {
 
 fn get_container_rootfs_path(obj: &Map<String, Value>) -> Result<PathBuf> {
     let rootfs = get_json_obj_key_string(obj, "root")?;
-    /*
-    let rootfs = obj.get("root")
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'root' doesn't exist",
-            )
-        })?
-        .as_str()
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'root' is not a string",
-            )
-        })?;
-    */
     Ok(PathBuf::from(rootfs))
 }
 
 fn get_container_bundle(obj: &Map<String, Value>) -> Result<PathBuf> {
     let bundle = get_json_obj_key_string(obj, "bundle")?;
-    /*
-    let bundle = obj.get("bundle")
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'bundle' doesn't exist",
-            )
-        })?
-        .as_str()
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'bundle' is not a string",
-            )
-        })?;
-    */
     Ok(PathBuf::from(bundle))
 }
 
@@ -194,102 +162,20 @@ fn get_container_config(obj: &Map<String, Value>) -> Result<Map<String, Value>> 
 }
 
 fn get_container_user(obj: &Map<String, Value>) -> Result<&Map<String, Value>> {
-
     let process_obj = get_json_obj_key_object(obj, "process")?;
     let user_obj = get_json_obj_key_object(process_obj, "user")?;
-    /*
-    let user_obj = obj.get("process")
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'process' doesn't exist",
-            )
-        })?
-        .as_object()
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'process' is not an object",
-            )
-        })?
-        .get("user")
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'user' doesn't exist",
-            )
-        })?
-        .as_object()
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'user' is not an object",
-            )
-        })?;
-    */
     Ok(user_obj)
 }
 
 fn get_container_uid(obj: &Map<String, Value>) -> Result<u32> {
     let user_obj = get_container_user(obj)?;
     let uid = get_json_obj_key_u32(user_obj, "uid")?;
-
-    /*
-    let uid_u64: u64 = user_obj.get("uid")
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'uid' doesn't exist",
-            )
-        })?
-        .as_u64()
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'uid' is not an u64",
-            )
-        })?;
-    let uid = match u32::try_from(uid_u64) {
-        Ok(n) => n,
-        Err(_) => {
-            return Err(Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'uid' cannot be converted to u32",
-            ));
-        },
-    };
-    */
     Ok(uid)
 }
 
 fn get_container_gid(obj: &Map<String, Value>) -> Result<u32> {
     let user_obj = get_container_user(obj)?;
     let gid = get_json_obj_key_u32(user_obj, "gid")?;
-    /*
-    let gid_u64: u64 = user_obj.get("gid")
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'gid' doesn't exist",
-            )
-        })?
-        .as_u64()
-        .ok_or_else(|| {
-            Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'gid' is not an u64",
-            )
-        })?;
-    let gid = match u32::try_from(gid_u64) {
-        Ok(n) => n,
-        Err(_) => {
-            return Err(Error::new(
-                ExitStatus::DataErr,
-                "Validation error: 'gid' cannot be converted to u32",
-            ));
-        },
-    };
-    */
     Ok(gid)
 }
 
@@ -304,23 +190,6 @@ fn get_annotation_option(key: &str, obj: &Map<String, Value>) -> Option<String> 
         Ok(s) => s,
         Err(_) => return None,
     };
-    /*
-    let annotations_obj = match obj.get("annotations") {
-        Some(av) => match av.as_object() {
-            Some(ao) => ao,
-            None => return None,
-        },
-        None => return None,
-    };
-
-    let string = match annotations_obj.get(key) {
-        Some(v) => match v.as_str() {
-            Some(s) => s.to_string(),
-            None => return None,
-        },
-        None => return None, 
-    };
-    */
 
     Some(string)
 }
