@@ -46,7 +46,6 @@ Add a `createContainer` hook entry similar to:
 
 | Status | Category | Meaning for `squashfs_mounts` |
 | ---: | --- | --- |
-| 65 | `EX_DATAERR` | Malformed OCI input or invalid `process.user.uid` |
-| 69 | `EX_UNAVAILABLE` | `getent` or the requested account lookup is unavailable |
-| 70 | `EX_SOFTWARE` | Invalid `getent` output or unexpected internal failure |
+| 65 | `EX_DATAERR` | Malformed input from OCI or annotation |
+| 69 | `EX_UNAVAILABLE` | Missing mount source or target  |
 | 74 | `EX_IOERR` | Input or output I/O failure |
