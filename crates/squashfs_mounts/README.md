@@ -34,7 +34,9 @@ Add a `createContainer` hook entry similar to:
     "path": "/opt/hooks/squashfs_mounts"
   },
   "when": {
-    "always": true
+    "annotations": {
+      "com.hooks.squashfs_mounts": "^.*$"
+    }
   },
   "stages": ["createContainer"]
 }
