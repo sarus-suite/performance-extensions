@@ -72,9 +72,25 @@ impl Mount {
             )
         })?;
 
+        let source_pb = PathBuf::from(source);
+        if !source_pb.is_file() {
+            return Err(Error::new(
+                ExitStatus::Unavailable,
+                format!("Validation error: source \"{source_pb:?}\" is not a file"),
+            ));
+        }
+
+        let target_pb = PathBuf::from(target);
+        if !target_pb.is_absolute() {
+            return Err(Error::new(
+                ExitStatus::DataErr,
+                format!("Validation error: mount target \"{target_pb:?}\" must be absolute"),
+            ));
+        }
+
         Ok(Mount {
-            source: PathBuf::from(source),
-            target: PathBuf::from(target),
+            source: source_pb,
+            target: target_pb,
         })
     }
 }
@@ -88,7 +104,7 @@ fn run() -> Result<()> {
 
 fn do_hook(obj: &Map<String, Value>) -> Result<()> {
     let status = get_container_status(obj);
-    match status.as_str() {
+    match status {
         "created" => do_create_container_hook(obj),
         &_ => Ok(()),
     }
@@ -128,13 +144,11 @@ fn pb_trim_root(pb: PathBuf) -> PathBuf {
     }
 }
 
-fn get_container_status(obj: &Map<String, Value>) -> String {
-    let status = match obj.get("status") {
+fn get_container_status(obj: &Map<String, Value>) -> &str {
+    match obj.get("status") {
         Some(s) => s.as_str().unwrap_or(""),
         None => "",
-    };
-
-    String::from(status)
+    }
 }
 
 fn get_container_rootfs_path(obj: &Map<String, Value>) -> Result<PathBuf> {
@@ -200,19 +214,12 @@ fn get_squashfuse_from_env() -> Option<String> {
 fn get_squashfuse_options() -> Vec<String> {
     let mut options: Vec<String> = vec![];
 
-    options.push(format!("-o"));
-    options.push(format!("allow_other"));
+    options.push(String::from("-o"));
+    options.push(String::from("allow_other"));
     options
 }
 
 fn squashfuse_mount(source: &Path, target: &Path) -> Result<()> {
-    if !source.is_file() {
-        return Err(Error::new(
-            ExitStatus::Unavailable,
-            format!("Validation error: source {:?} is not a file", source),
-        ));
-    }
-
     if !target.exists() {
         return Err(Error::new(
             ExitStatus::Unavailable,
@@ -249,18 +256,19 @@ fn squashfuse_mount(source: &Path, target: &Path) -> Result<()> {
         .arg(source)
         .arg(target)
         .output()
-        .map_err(|_| {
+        .map_err(|e| {
             return Err::<(), Error>(Error::new(
                 ExitStatus::IoErr,
-                "Error: cannot spawn squashfuse mount process",
+                format!("Error: cannot spawn squashfuse mount process, {e}"),
             ));
         })
         .unwrap();
 
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(Error::new(
             ExitStatus::IoErr,
-            "Error: squashfuse mount failed",
+            format!("Error: squashfuse mount failed, {stderr}"),
         ));
     }
     Ok(())
@@ -308,32 +316,29 @@ fn create_directory_tree(path: &Path, uid: u32, gid: u32, perms: &Permissions) -
     while d.is_some() {
         let dirname = d.unwrap();
         folder = folder.join(PathBuf::from(dirname));
-        let _ = create_dir(&folder).map_err(|_| {
+        let _ = create_dir(&folder).map_err(|e| {
             return Err::<(), Error>(Error::new(
                 ExitStatus::IoErr,
-                format!("Error: cannot create directory at: {:?}", folder),
+                format!("Error: cannot create directory at \"{folder:?}\", {e}"),
             ));
         });
 
         match set_permissions(&folder, perms.clone()) {
             Ok(_) => {}
-            Err(_) => {
+            Err(e) => {
                 return Err::<(), Error>(Error::new(
                     ExitStatus::IoErr,
-                    format!(
-                        "Error: cannot set permissions for directory at: {:?}",
-                        folder
-                    ),
+                    format!("Error: cannot set permissions for directory at \"{folder:?}\", {e}"),
                 ));
             }
         };
 
         match chown(&folder, Some(uid), Some(gid)) {
             Ok(_) => {}
-            Err(_) => {
+            Err(e) => {
                 return Err::<(), Error>(Error::new(
                     ExitStatus::IoErr,
-                    format!("Error: cannot set ownership for directory at: {:?}", folder),
+                    format!("Error: cannot set ownership for directory at \"{folder:?}\", {e}"),
                 ));
             }
         };
