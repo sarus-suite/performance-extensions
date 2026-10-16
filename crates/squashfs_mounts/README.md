@@ -5,7 +5,7 @@ Mounts SquashFS files from the host in the container.
 **What it does**
 
 On createContainer stage:
-* Reads the **container config JSON** from `stdin`.
+* Reads the **container state JSON** from `stdin`.
 * Reads SquashFS mounts from com.hooks.squashfs_mounts annotation.
 * Reads PARALLAX_MP_SQUASHFUSE_CMD environment variable, if missing uses "squashfuse_ll" as default.
 * Create mount point directory tree for each mount, when missing.
