@@ -103,6 +103,7 @@ jobs:
             cp target/release/mkhomedir         "dist/hooks-${HOOKS_ARCH}/mkhomedir"
             cp target/release/pc_injection_hook "dist/hooks-${HOOKS_ARCH}/pc_injection_hook"
             cp target/release/pmix_hook         "dist/hooks-${HOOKS_ARCH}/pmix_hook"
+            cp target/release/squashfs_mounts   "dist/hooks-${HOOKS_ARCH}/squashfs_mounts"
 
             ls -lah "dist/hooks-${HOOKS_ARCH}"
             EOF
@@ -137,6 +138,7 @@ jobs:
           test -x "$hooks_dir/mkhomedir"
           test -x "$hooks_dir/pc_injection_hook"
           test -x "$hooks_dir/pmix_hook"
+          test -x "$hooks_dir/squashfs_mounts"
 
           "$sarus_suite_shell" --import-hook-dir "$hooks_dir" -- sarus-suite-check
 
@@ -156,4 +158,5 @@ jobs:
             command -v mkhomedir
             command -v pc_injection_hook
             command -v pmix_hook
+            command -v squashfs_mounts
           '
