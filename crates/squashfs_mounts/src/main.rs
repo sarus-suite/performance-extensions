@@ -118,10 +118,10 @@ fn do_create_container_hook(obj: &Map<String, Value>) -> Result<()> {
 
     let squashfs_mounts = squashfs_mounts_string.split(";");
 
-    let rootfs_dirpath = get_container_rootfs_path(obj)?;
 
     let perms = Permissions::from_mode(DIR_MODE);
     let config = get_container_config(obj)?;
+    let rootfs_dirpath = get_container_rootfs_path(&config)?;
     let user_obj = get_config_user(&config)?;
     let uid = get_config_user_uid(&user_obj)?;
     let gid = get_config_user_gid(&user_obj)?;
@@ -151,8 +151,9 @@ fn get_container_status(obj: &Map<String, Value>) -> &str {
     }
 }
 
-fn get_container_rootfs_path(obj: &Map<String, Value>) -> Result<PathBuf> {
-    let rootfs = get_json_obj_key_string(obj, "root")?;
+fn get_container_rootfs_path(config: &Map<String, Value>) -> Result<PathBuf> {
+    let root_obj = get_json_obj_key_object(config, "root")?;
+    let rootfs = get_json_obj_key_string(root_obj, "path")?;
     Ok(PathBuf::from(rootfs))
 }
 
