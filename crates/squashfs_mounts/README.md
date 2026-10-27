@@ -11,7 +11,7 @@ On createContainer stage:
 * Create mount point directory tree for each mount, when missing.
 * Mounts source SquashFS files at target mount points.
 
-Mounts are removed at container stop.
+Mounts are automatically removed at container stop, because they are created in the createContainer hook namespace.
 
 
 **Requirements**
