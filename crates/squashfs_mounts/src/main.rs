@@ -1,14 +1,17 @@
 use standard_hook_diagnostics::{write_error, ExitStatus};
-use serde_json::{Map, Value};
 use std::{
     env::var,
     ffi::OsString,
     fmt,
-    fs::{create_dir, read_to_string, set_permissions, Permissions},
-    io::{self, Read},
+    fs::{create_dir, set_permissions, Permissions},
     os::unix::fs::{chown, PermissionsExt},
     path::{Path, PathBuf},
     process::{self, Command},
+};
+use oci_spec::runtime::{
+    Spec,
+    State,
+    User,
 };
 
 const HOOK_ANNOTATION_KEY: &str = "com.hooks.squashfs_mounts";
@@ -96,35 +99,26 @@ impl Mount {
 }
 
 fn run() -> Result<()> {
-    let value = read_stdin_json()?;
-    let obj = ensure_obj(value.as_object(), "top-level JSON must be an object")?;
-    do_hook(obj)?;
-    Ok(())
-}
+    let state = State::load("/dev/stdin").map_err(|_| {
+        return Err::<(), Error>(Error::new(
+            ExitStatus::IoErr,
+            format!("IO error: failed to read state from stdin"),
+        ));
+    }).unwrap();
 
-fn do_hook(obj: &Map<String, Value>) -> Result<()> {
-    let status = get_container_status(obj);
-    match status {
-        "created" => do_create_container_hook(obj),
-        &_ => Ok(()),
-    }
-}
-
-fn do_create_container_hook(obj: &Map<String, Value>) -> Result<()> {
-    let squashfs_mounts_string = match get_annotation_option(HOOK_ANNOTATION_KEY, obj) {
+    let squashfs_mounts_string = match get_annotation_option(HOOK_ANNOTATION_KEY, &state) {
         Some(s) => s,
         None => return Ok(()),
     };
 
     let squashfs_mounts = squashfs_mounts_string.split(";");
 
-
     let perms = Permissions::from_mode(DIR_MODE);
-    let config = get_container_config(obj)?;
+    let config = get_container_config(&state)?;
     let rootfs_dirpath = get_container_rootfs_path(&config)?;
-    let user_obj = get_config_user(&config)?;
-    let uid = get_config_user_uid(&user_obj)?;
-    let gid = get_config_user_gid(&user_obj)?;
+    let user = get_config_user(&config)?;
+    let uid = user.uid();
+    let gid = user.gid();
 
     for mount_string in squashfs_mounts {
         let mount = Mount::from_string(mount_string)?;
@@ -144,65 +138,50 @@ fn pb_trim_root(pb: PathBuf) -> PathBuf {
     }
 }
 
-fn get_container_status(obj: &Map<String, Value>) -> &str {
-    match obj.get("status") {
-        Some(s) => s.as_str().unwrap_or(""),
-        None => "",
-    }
+fn get_container_rootfs_path(config: &Spec) -> Result<PathBuf> {
+    let root_obj = config.root().clone().ok_or_else(|| {
+        Error::new(
+            ExitStatus::DataErr,
+            &format!("Validation error: missing root in config.json"),
+        )
+    })?;
+    let rootfs = root_obj.path().clone();
+    Ok(rootfs)
 }
 
-fn get_container_rootfs_path(config: &Map<String, Value>) -> Result<PathBuf> {
-    let root_obj = get_json_obj_key_object(config, "root")?;
-    let rootfs = get_json_obj_key_string(root_obj, "path")?;
-    Ok(PathBuf::from(rootfs))
-}
-
-fn get_container_bundle(obj: &Map<String, Value>) -> Result<PathBuf> {
-    let bundle = get_json_obj_key_string(obj, "bundle")?;
-    Ok(PathBuf::from(bundle))
-}
-
-fn get_container_config(obj: &Map<String, Value>) -> Result<Map<String, Value>> {
-    let bundle = get_container_bundle(obj)?;
+fn get_container_config(state: &State) -> Result<Spec> {
+    let bundle = state.bundle();
     let config_file = bundle.join(PathBuf::from("config.json"));
-    let config_str = read_to_string(config_file)
-        .map_err(|e| Error::new(ExitStatus::IoErr, format!("Failed to read from file: {e}")))?;
-    let config_value: Value = serde_json::from_str(&config_str)
-        .map_err(|e| Error::new(ExitStatus::DataErr, format!("Invalid Config JSON: {e}")))?;
-    let config_obj = ensure_obj(
-        config_value.as_object(),
-        "Unable to find root object in Config JSON",
-    )?
-    .clone();
-
-    Ok(config_obj)
+    let config = Spec::load(config_file).map_err(|_| {
+        return Err::<(), Error>(Error::new(
+            ExitStatus::DataErr,
+            format!("Validation error: failed to load config.json"),
+        ));
+    }).unwrap();
+    Ok(config)
 }
 
-fn get_config_user(config_obj: &Map<String, Value>) -> Result<&Map<String, Value>> {
-    let process_obj = get_json_obj_key_object(config_obj, "process")?;
-    let user_obj = get_json_obj_key_object(process_obj, "user")?;
-    Ok(user_obj)
+fn get_config_user(config: &Spec) -> Result<User> {
+    let process = config.process().clone().ok_or_else(|| {
+        Error::new(
+            ExitStatus::DataErr,
+            &format!("Validation error: missing process in config.json"),
+        )
+    })?;
+
+    let user = process.user().clone();
+    Ok(user)
 }
 
-fn get_config_user_uid(user_obj: &Map<String, Value>) -> Result<u32> {
-    let uid = get_json_obj_key_u32(user_obj, "uid")?;
-    Ok(uid)
-}
-
-fn get_config_user_gid(user_obj: &Map<String, Value>) -> Result<u32> {
-    let gid = get_json_obj_key_u32(user_obj, "gid")?;
-    Ok(gid)
-}
-
-fn get_annotation_option(key: &str, obj: &Map<String, Value>) -> Option<String> {
-    let annotation_obj = match get_json_obj_key_object(obj, "annotations") {
-        Ok(o) => o,
-        Err(_) => return None,
+fn get_annotation_option(key: &str, state: &State) -> Option<String> {
+    let annotations = match state.annotations() {
+        None => return None,
+        Some(a) => a, 
     };
 
-    let string = match get_json_obj_key_string(annotation_obj, key) {
-        Ok(s) => s,
-        Err(_) => return None,
+    let string = match annotations.get(key) {
+        None => return None,
+        Some(s) => s.to_string(),
     };
 
     Some(string)
@@ -354,100 +333,4 @@ fn is_empty_directory(path: &Path) -> bool {
         Ok(mut content) => content.next().is_none(),
         Err(_) => false,
     }
-}
-
-fn get_json_obj_key_string(obj: &Map<String, Value>, key: &str) -> Result<String> {
-    let value = get_json_obj_key_value(obj, key)?;
-    let string = get_json_value_as_string(value, key)?;
-    Ok(String::from(string))
-}
-
-fn get_json_obj_key_object<'a>(
-    obj: &'a Map<String, Value>,
-    key: &'a str,
-) -> Result<&'a Map<String, Value>> {
-    let value = get_json_obj_key_value(obj, key)?;
-    let object = get_json_value_as_object(value, key)?;
-    Ok(object)
-}
-
-fn get_json_obj_key_u32(obj: &Map<String, Value>, key: &str) -> Result<u32> {
-    let value = get_json_obj_key_value(obj, key)?;
-    let number = get_json_value_as_u32(value, key)?;
-    Ok(number)
-}
-
-fn get_json_obj_key_value<'a>(obj: &'a Map<String, Value>, key: &'a str) -> Result<&'a Value> {
-    let value = obj.get(key).ok_or_else(|| {
-        Error::new(
-            ExitStatus::DataErr,
-            format!("Validation error: '{key}' doesn't exist"),
-        )
-    })?;
-
-    Ok(value)
-}
-
-fn get_json_value_as_string(value: &Value, key: &str) -> Result<String> {
-    let string = value.as_str().ok_or_else(|| {
-        Error::new(
-            ExitStatus::DataErr,
-            format!("Validation error: '{key}' is not a string"),
-        )
-    })?;
-
-    Ok(String::from(string))
-}
-
-fn get_json_value_as_object<'a>(value: &'a Value, key: &'a str) -> Result<&'a Map<String, Value>> {
-    let obj = value.as_object().ok_or_else(|| {
-        Error::new(
-            ExitStatus::DataErr,
-            format!("Validation error: '{key}' is not an object"),
-        )
-    })?;
-
-    Ok(obj)
-}
-
-fn get_json_value_as_u32(value: &Value, key: &str) -> Result<u32> {
-    let num_u64 = value.as_u64().ok_or_else(|| {
-        Error::new(
-            ExitStatus::DataErr,
-            format!("Validation error: '{key}' is not an u64 number"),
-        )
-    })?;
-    let num_u32 = match u32::try_from(num_u64) {
-        Ok(n) => n,
-        Err(_) => {
-            return Err(Error::new(
-                ExitStatus::DataErr,
-                format!("Validation error: '{key}' cannot be converted to u32"),
-            ));
-        }
-    };
-
-    Ok(num_u32)
-}
-
-// createContainer hook takes as stdin the state json
-// We return error if we cannot read or
-// if we cannot parse a valid input json
-fn read_stdin_json() -> Result<Value> {
-    let mut input = String::new();
-
-    io::stdin()
-        .read_to_string(&mut input)
-        .map_err(|e| Error::new(ExitStatus::IoErr, format!("Failed to read from stdin: {e}")))?;
-
-    serde_json::from_str(&input)
-        .map_err(|e| Error::new(ExitStatus::DataErr, format!("Invalid JSON: {e}")))
-}
-
-/// Ensure a `Value` is an object and return it as a map.
-fn ensure_obj<'a>(
-    candidate: Option<&'a Map<String, Value>>,
-    err: &str,
-) -> Result<&'a Map<String, Value>> {
-    candidate.ok_or_else(|| Error::new(ExitStatus::DataErr, format!("Validation error: {err}")))
 }
