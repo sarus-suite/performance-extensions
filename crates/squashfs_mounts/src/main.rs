@@ -1,3 +1,4 @@
+use oci_spec::runtime::{Spec, State, User};
 use standard_hook_diagnostics::{write_error, ExitStatus};
 use std::{
     env::var,
@@ -7,11 +8,6 @@ use std::{
     os::unix::fs::{chown, PermissionsExt},
     path::{Path, PathBuf},
     process::{self, Command},
-};
-use oci_spec::runtime::{
-    Spec,
-    State,
-    User,
 };
 
 const HOOK_ANNOTATION_KEY: &str = "com.hooks.squashfs_mounts";
@@ -99,19 +95,19 @@ impl Mount {
 }
 
 fn run() -> Result<()> {
-    let state = State::load("/dev/stdin").map_err(|_| {
-        return Err::<(), Error>(Error::new(
+    let state: State = serde_json::from_reader(std::io::stdin()).map_err(|_| {
+        Error::new(
             ExitStatus::IoErr,
-            format!("IO error: failed to read state from stdin"),
-        ));
-    }).unwrap();
+            "IO error: failed to read state from stdin",
+        )
+    })?;
 
     let squashfs_mounts_string = match get_annotation_option(HOOK_ANNOTATION_KEY, &state) {
         Some(s) => s,
         None => return Ok(()),
     };
 
-    let squashfs_mounts = squashfs_mounts_string.split(";");
+    let squashfs_mounts = squashfs_mounts_string.split(";").filter(|s| !s.is_empty());
 
     let perms = Permissions::from_mode(DIR_MODE);
     let config = get_container_config(&state)?;
@@ -122,7 +118,7 @@ fn run() -> Result<()> {
 
     for mount_string in squashfs_mounts {
         let mount = Mount::from_string(mount_string)?;
-        let mount_target_relpath = pb_trim_root(PathBuf::from(&mount.target));
+        let mount_target_relpath = pb_trim_root(&mount.target);
         let mountpoint_dirpath = rootfs_dirpath.join(mount_target_relpath);
         create_directory_tree(&mountpoint_dirpath, uid, gid, &perms)?;
         squashfuse_mount(&mount.source, &mountpoint_dirpath)?;
@@ -131,18 +127,15 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-fn pb_trim_root(pb: PathBuf) -> PathBuf {
-    match pb.strip_prefix("/") {
-        Ok(p) => p.to_path_buf(),
-        Err(_) => pb,
-    }
+fn pb_trim_root(pb: &Path) -> &Path {
+    pb.strip_prefix("/").unwrap_or(pb)
 }
 
 fn get_container_rootfs_path(config: &Spec) -> Result<PathBuf> {
     let root_obj = config.root().clone().ok_or_else(|| {
         Error::new(
             ExitStatus::DataErr,
-            &format!("Validation error: missing root in config.json"),
+            "Validation error: missing root in config.json",
         )
     })?;
     let rootfs = root_obj.path().clone();
@@ -153,11 +146,11 @@ fn get_container_config(state: &State) -> Result<Spec> {
     let bundle = state.bundle();
     let config_file = bundle.join(PathBuf::from("config.json"));
     let config = Spec::load(config_file).map_err(|_| {
-        return Err::<(), Error>(Error::new(
+        Error::new(
             ExitStatus::DataErr,
             format!("Validation error: failed to load config.json"),
-        ));
-    }).unwrap();
+        )
+    })?;
     Ok(config)
 }
 
@@ -176,7 +169,7 @@ fn get_config_user(config: &Spec) -> Result<User> {
 fn get_annotation_option(key: &str, state: &State) -> Option<String> {
     let annotations = match state.annotations() {
         None => return None,
-        Some(a) => a, 
+        Some(a) => a,
     };
 
     let string = match annotations.get(key) {
@@ -231,18 +224,17 @@ fn squashfuse_mount(source: &Path, target: &Path) -> Result<()> {
     }
 
     let output = Command::new(cmd)
-        .args(options)
-        .args(additional_options)
+        .args(&options)
+        .args(&additional_options)
         .arg(source)
         .arg(target)
         .output()
         .map_err(|e| {
-            return Err::<(), Error>(Error::new(
+            Error::new(
                 ExitStatus::IoErr,
                 format!("Error: cannot spawn squashfuse mount process, {e}"),
-            ));
-        })
-        .unwrap();
+            )
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -251,6 +243,7 @@ fn squashfuse_mount(source: &Path, target: &Path) -> Result<()> {
             format!("Error: squashfuse mount failed, {stderr}"),
         ));
     }
+
     Ok(())
 }
 
