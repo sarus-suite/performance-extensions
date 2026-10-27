@@ -44,7 +44,7 @@ Add a `createContainer` hook entry similar to:
 
 ### Exit statuses
 
-`squashfs_mounts` reuses the shared precreate-hook categories and does not define hook-specific codes.
+`squashfs_mounts` reuses the shared standard-hook categories and does not define hook-specific codes.
 
 | Status | Category | Meaning for `squashfs_mounts` |
 | ---: | --- | --- |

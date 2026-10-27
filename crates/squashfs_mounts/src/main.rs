@@ -1,4 +1,4 @@
-use precreate_hook_diagnostics::{write_error, ExitStatus};
+use standard_hook_diagnostics::{write_error, ExitStatus};
 use serde_json::{Map, Value};
 use std::{
     env::var,
@@ -429,7 +429,7 @@ fn get_json_value_as_u32(value: &Value, key: &str) -> Result<u32> {
     Ok(num_u32)
 }
 
-// Precreate takes as stdin the container config json
+// createContainer hook takes as stdin the state json
 // We return error if we cannot read or
 // if we cannot parse a valid input json
 fn read_stdin_json() -> Result<Value> {
