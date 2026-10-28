@@ -1,0 +1,52 @@
+#!/bin/sh
+
+# Optional SSH experiment; never invoked during container startup.
+
+set -eu
+fail() { echo "hpc-dev-sshd: $*" >&2; exit 1; }
+uid=$(id -u)
+[ "$uid" -ne 0 ] || fail "run as the user supplied by Sarus/Podman"
+user=$(id -un)
+case "$user" in ''|*[!a-zA-Z0-9_.-]*) fail "unsupported account name" ;; esac
+state=${HPC_DEV_SSH_DIR:-/run/hpc-dev-ssh}
+case "$state" in /*) ;; *) fail "HPC_DEV_SSH_DIR must be an absolute path" ;; esac
+key=$state/ssh_host_ed25519_key
+bundle=/usr/local/libexec/hpc-sshd
+for executable in sshd sshd-auth sshd-session ssh-keygen; do
+    [ -x "$bundle/$executable" ] || fail "missing bundled $executable"
+done
+
+prepare() {
+    umask 077
+    mkdir -p "$state" || fail "cannot create SSH state directory: $state"
+    [ ! -L "$state" ] || fail "SSH state directory must not be a symlink"
+    [ -O "$state" ] || fail "SSH state directory must belong to the current user"
+    chmod 0700 "$state" || fail "cannot protect SSH state directory: $state"
+    if [ ! -f "$key" ]; then
+        "$bundle/ssh-keygen" -q -t ed25519 -N '' -f "$key"
+    fi
+    # This may fail on the target OpenSSH build. Leave the account untouched.
+    "$bundle/sshd" -t -f /etc/ssh/sshd_config.podman \
+        -h "$key" \
+        -o "SshdAuthPath=$bundle/sshd-auth" \
+        -o "SshdSessionPath=$bundle/sshd-session" \
+        -o "AllowUsers=$user" \
+        -o "PidFile=$state/sshd.pid"
+}
+
+case "${1:-}" in
+--prepare)
+    [ "$#" -eq 1 ] || fail "usage: hpc-dev-sshd [--prepare]"
+    prepare
+    exit 0
+    ;;
+'') [ "$#" -eq 0 ] || fail "usage: hpc-dev-sshd [--prepare]" ;;
+*) fail "usage: hpc-dev-sshd [--prepare]" ;;
+esac
+prepare
+exec "$bundle/sshd" -i -e -f /etc/ssh/sshd_config.podman \
+    -h "$key" \
+    -o "SshdAuthPath=$bundle/sshd-auth" \
+    -o "SshdSessionPath=$bundle/sshd-session" \
+    -o "AllowUsers=$user" \
+    -o "PidFile=$state/sshd.pid"

@@ -1,0 +1,23 @@
+# ONLY for `sshd -i` over an authenticated outer SSH connection. Never listen
+# on a network socket using this passwordless configuration.
+
+# hpc-dev-sshd supplies the current user's HostKey, AllowUsers, and PidFile.
+# Passwordless authentication is an experiment, not assumed to work with the
+# account provided by Sarus. No account or password files are modified.
+
+PermitRootLogin no
+LogLevel ERROR
+KbdInteractiveAuthentication no
+PermitTTY yes
+AllowTcpForwarding yes
+AllowAgentForwarding no
+X11Forwarding no
+Subsystem sftp internal-sftp
+
+# sshd resets PATH; include CUDA for noninteractive remote commands as well.
+SetEnv PATH=/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+AuthenticationMethods publickey
+PubkeyAuthentication yes
+AuthorizedKeysFile /etc/ssh/hpc-dev-authorized_keys
+PasswordAuthentication no
+PermitEmptyPasswords no
