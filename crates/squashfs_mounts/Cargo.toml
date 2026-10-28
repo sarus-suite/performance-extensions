@@ -1,0 +1,10 @@
+[package]
+name = "squashfs_mounts"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+oci-spec = "0.10.0"
+serde_json = "1.0.154"
+standard_hook_diagnostics = { path = "../standard_hook_diagnostics" }

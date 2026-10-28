@@ -1,12 +1,14 @@
 [workspace]
 members = [
     "crates/precreate_hook_diagnostics",
+    "crates/standard_hook_diagnostics",
     "crates/pce_hook",
     "crates/mps_hook",
     "crates/ldcache_hook",
     "crates/pc_injection_hook",
     "crates/mkhomedir",
     "crates/sethomevar",
+    "crates/squashfs_mounts",
     "crates/pmix_hook",
 ]
 resolver = "2"
