@@ -84,6 +84,7 @@ fn write_stdout_json(value: &Value) -> Result<()> {
 fn apply_pmix_updates(obj: &mut Map<String, Value>) -> Result<()> {
     let container_env = get_process_env_hashmap(obj)?;
 
+    let slurm_job_uid = get_env_entry_str(&container_env, "SLURM_JOB_UID");
     let slurm_job_id = get_env_entry_str(&container_env, "SLURM_JOB_ID");
     let slurm_step_id = get_env_entry_str(&container_env, "SLURM_STEP_ID");
 
@@ -124,7 +125,7 @@ fn apply_pmix_updates(obj: &mut Map<String, Value>) -> Result<()> {
         if !pmix_system_tmpdir.is_empty() {
             let folder = pmix_system_tmpdir.trim_end_matches('/');
             let folder_format1 =
-                format!("{folder}/spmix_appdir_{slurm_job_id}_{slurm_job_id}.{slurm_step_id}");
+                format!("{folder}/spmix_appdir_{slurm_job_uid}_{slurm_job_id}.{slurm_step_id}");
             let folder_format2 = format!("{folder}/spmix_appdir_{slurm_job_id}.{slurm_step_id}");
 
             if PathBuf::from(&folder_format1).is_dir() {
