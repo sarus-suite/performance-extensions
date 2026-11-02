@@ -126,12 +126,9 @@ fn apply_pmix_updates(obj: &mut Map<String, Value>) -> Result<()> {
             let folder = pmix_system_tmpdir.trim_end_matches('/');
             let folder_format1 =
                 format!("{folder}/spmix_appdir_{slurm_job_uid}_{slurm_job_id}.{slurm_step_id}");
-            let folder_format2 = format!("{folder}/spmix_appdir_{slurm_job_id}.{slurm_step_id}");
 
             if PathBuf::from(&folder_format1).is_dir() {
                 add_mount(obj, &folder_format1)?;
-            } else if PathBuf::from(&folder_format2).is_dir() {
-                add_mount(obj, &folder_format2)?;
             }
         }
     }
