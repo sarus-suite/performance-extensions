@@ -32,6 +32,15 @@ jobs:
           # for manual trigger
           ref: ${{ inputs.ref != '' && inputs.ref || github.ref_name }}
 
+      - name: Build bundled SSH assets
+        uses: devcontainers/ci@v0.3
+        with:
+          imageName: performance-extensions-glibc-builder-${{ matrix.arch }}
+          configFile: .devcontainer/glibc/devcontainer.json
+          push: never
+          runCmd: |
+            TARGET_ARCH=${{ matrix.arch }} ./scripts/build-hpc-sshd.sh
+
       - name: Login to GHCR
         uses: docker/login-action@v4
         with:
@@ -58,6 +67,7 @@ jobs:
               mkdir -p dist/hooks-${{ matrix.arch }}
               cp target/release/ldcache_hook "dist/hooks-${{ matrix.arch }}/ldcache_hook"
               cp target/release/pce_hook "dist/hooks-${{ matrix.arch }}/pce_hook"
+              cp target/release/ssh_precreate_hook "dist/hooks-${{ matrix.arch }}/ssh_precreate_hook"
               cp target/release/mps_hook "dist/hooks-${{ matrix.arch }}/mps_hook"
               cp target/release/sethomevar "dist/hooks-${{ matrix.arch }}/sethomevar"
               cp target/release/mkhomedir "dist/hooks-${{ matrix.arch }}/mkhomedir"

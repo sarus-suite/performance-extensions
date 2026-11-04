@@ -1,0 +1,13 @@
+{
+  "version": "1.0.0",
+  "hook": {
+    "path": "@@SARUS_SUITE_HOOK_BIN@@/ssh_precreate_hook",
+    "args": ["@@SARUS_SUITE_HOOK_BIN@@/ssh_precreate_hook"]
+  },
+  "when": {
+    "annotations": {
+      "ssh.authorized_key": "^.+$"
+    }
+  },
+  "stages": ["precreate"]
+}

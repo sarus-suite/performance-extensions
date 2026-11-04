@@ -70,6 +70,15 @@ jobs:
           zgrep CONFIG_USER_NS /proc/config.gz 2>/dev/null || true
           grep CONFIG_USER_NS "/boot/config-$(uname -r)" 2>/dev/null || true
 
+      - name: Build bundled SSH assets
+        uses: devcontainers/ci@v0.3
+        with:
+          imageName: performance-extensions-glibc-builder-${{ matrix.arch }}
+          configFile: .devcontainer/glibc/devcontainer.json
+          push: never
+          runCmd: |
+            TARGET_ARCH=${{ matrix.arch }} ./scripts/build-hpc-sshd.sh
+
       - name: Install host prerequisites
         run: |
           set -euxo pipefail

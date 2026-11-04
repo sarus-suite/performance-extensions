@@ -23,6 +23,11 @@ Annotation-driven. Fully static binaries. Works on any Linux node.
   Reads container config from `stdin`, applies env + mount edits from `PCE_INPUT`, and writes the
   updated config to `stdout` during Podman's `precreate` stage.
 
+* *Ephemeral SSH access* [(ssh_precreate_hook)](https://github.com/sarus-suite/performance-extensions/tree/main/crates/ssh_precreate_hook)
+  Validates a user-supplied SSH public key, bind-mounts it as `authorized_keys` with a bundled
+  OpenSSH server during `precreate`, and provisions the host-side `container-ssh-proxy` helper
+  in the user's `~/.local/bin`.
+
 * *Refresh loader cache* [(ldcache_hook)](https://github.com/sarus-suite/performance-extensions/tree/main/crates/ldcache_hook)
   On `prestart`, runs `ldconfig -v -r <rootfs>` (override with `LDCONFIG_PATH`).
 
