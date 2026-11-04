@@ -138,15 +138,17 @@ concurrently running containers for the same user.
 
 ## Failure behavior
 
-The supplied hook registration invokes the hook only when
-`ssh.authorized_key` is non-empty. Once invoked, the hook validates the key and
-fails if it is missing or invalid; the missing-key check also protects direct
-invocations and alternate hook registrations. The hook also fails if another
-precreate invocation holds its state lock. The lock is removed automatically on
-normal exit. If an interrupted process leaves
-`/run/user/<host-uid>/sarus-hook/.lock` behind, the owner must remove it before
-retrying. Errors are also recorded through the shared precreate diagnostics
-facility.
+The supplied hook registration does not invoke the hook when
+`ssh.authorized_key` is absent or empty. Once invoked, the hook fails if the key
+is invalid; it also rejects a missing key when invoked directly or through an
+alternate registration. A non-blocking kernel lock makes concurrent preparation
+for the same host user fail immediately. The kernel releases that lock whenever
+the owning process exits, including after a crash or forced termination. The
+persistent `.lock` file is harmless and requires no cleanup. All hook errors are
+also recorded through the shared precreate diagnostics facility. This lock
+protects only precreate-time shared-state preparation; it does not limit SSH
+connections. Each `container-ssh-proxy connect` invocation starts an independent
+`sshd -i` session after hook preparation has completed.
 
 The hook translates namespace UID 0 through `/proc/self/uid_map` before
 selecting the host-UID directory. This prevents different users' rootless

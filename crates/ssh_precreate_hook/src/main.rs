@@ -4,9 +4,12 @@ use std::{
     fmt, fs,
     io::{self, Read, Seek, SeekFrom, Write},
     mem::MaybeUninit,
-    os::unix::{
-        ffi::OsStrExt,
-        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::{
+        fd::AsRawFd,
+        unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        },
     },
     path::{Path, PathBuf},
     process::{self, Command},
@@ -1087,27 +1090,52 @@ fn add_mounts(config: &mut Map<String, Value>, specs: &[MountSpec<'_>]) -> Resul
     Ok(())
 }
 
-struct Lock(PathBuf);
+#[derive(Debug)]
+struct Lock {
+    _file: fs::File,
+}
 
 impl Lock {
     fn acquire(state: &Path) -> Result<Self> {
         let path = state.join(".lock");
-        fs::create_dir(&path).map_err(|error| {
-            Error::new(
-                ExitStatus::Unavailable,
-                format!(
-                    "SSH preparation is already running (or {} remains): {error}",
-                    path.display()
-                ),
-            )
-        })?;
-        Ok(Self(path))
-    }
-}
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(FILE_MODE)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|error| {
+                Error::new(
+                    ExitStatus::IoErr,
+                    format!("failed to open state lock {}: {error}", path.display()),
+                )
+            })?;
+        validate_open_file(&file, &path, "state lock")?;
+        file.set_permissions(fs::Permissions::from_mode(FILE_MODE))
+            .map_err(|error| {
+                Error::new(
+                    ExitStatus::IoErr,
+                    format!("failed to protect state lock {}: {error}", path.display()),
+                )
+            })?;
 
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.0);
+        // SAFETY: file owns a valid descriptor for the lifetime of the Lock guard.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Err(Error::new(
+                    ExitStatus::Unavailable,
+                    "SSH preparation is already running",
+                ));
+            }
+            return Err(Error::new(
+                ExitStatus::IoErr,
+                format!("failed to acquire state lock {}: {error}", path.display()),
+            ));
+        }
+
+        Ok(Self { _file: file })
     }
 }
 
@@ -1300,6 +1328,22 @@ mod tests {
     #[test]
     fn maps_a_uid_inside_a_larger_range() {
         assert_eq!(host_uid_from_map(42, "0 100000 65536\n").unwrap(), 100_042);
+    }
+
+    #[test]
+    fn state_lock_rejects_contention_and_releases_on_drop() {
+        let state = temp_home("state-lock");
+        let first = Lock::acquire(&state).unwrap();
+
+        let error = Lock::acquire(&state).unwrap_err();
+        assert_eq!(error.exit_status(), ExitStatus::Unavailable);
+
+        drop(first);
+        let second = Lock::acquire(&state).unwrap();
+        drop(second);
+
+        assert!(state.join(".lock").is_file());
+        fs::remove_dir_all(state).unwrap();
     }
 
     #[test]
