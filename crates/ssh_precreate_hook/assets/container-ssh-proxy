@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+# managed-by: performance-extensions
+# component: container-ssh-proxy
+# version: 0.1.0
+"""Discover foreground Sarus Podman sessions owned by the current Linux user."""
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+SSH_AUTHORIZED_KEY_ANNOTATION = "ssh.authorized_key"
+
+# Recognize option boundaries rather than searching for a word named "run".
+GLOBAL_VALUES = {
+    "--root", "--runroot", "--module", "--storage-opt", "--storage-driver",
+    "--runtime", "--runtime-flag", "--conmon", "--cgroup-manager", "--tmpdir",
+    "--log-level", "--events-backend", "--network-config-dir", "--network-backend",
+    "--volumepath", "--db-backend", "--hooks-dir", "--registries-conf",
+    "--registries-conf-dir", "--default-mounts-file", "--imagestore",
+}
+GLOBAL_FLAGS = {"--syslog", "--transient-store"}
+RUN_VALUES = {
+    "--name", "--user", "-u", "--volume", "-v", "--mount", "--env", "-e",
+    "--env-file", "--workdir", "-w", "--device", "--annotation", "--label", "-l",
+    "--entrypoint", "--userns", "--group-add", "--security-opt", "--cap-add",
+    "--cap-drop", "--network", "--net", "--ipc", "--pid", "--uts", "--hostname",
+    "-h", "--cgroupns", "--cgroups", "--pull", "--shm-size", "--ulimit",
+    "--cidfile", "--passwd-entry", "--group-entry", "--detach-keys", "--platform",
+}
+RUN_FLAGS = {"--interactive", "--tty", "--detach", "--rm", "--init", "--read-only",
+             "--env-host", "--privileged", "--replace", "--passwd"}
+
+
+def option_end(args, i, values, flags):
+    token = args[i]
+    key = token.split("=", 1)[0]
+    if key in values:
+        end = i + (1 if "=" in token else 2)
+        if end > len(args):
+            raise ValueError("missing value for " + key)
+        return end
+    if key in flags:
+        return i + 1
+    raise ValueError("unsupported option " + token)
+
+
+def parse_invocation(args):
+    if not args or Path(args[0]).name != "podman":
+        return None
+    if not os.path.isabs(args[0]):
+        raise ValueError("Podman executable is not an absolute path")
+    i = 1
+    roots = set()
+    while i < len(args) and args[i].startswith("-"):
+        roots.add(args[i].split("=", 1)[0])
+        i = option_end(args, i, GLOBAL_VALUES, GLOBAL_FLAGS)
+    if i == len(args) or args[i] != "run":
+        return None
+    if not {"--root", "--runroot"} <= roots:
+        return None  # This helper targets Sarus's per-invocation stores.
+    command = args[:i]
+    i += 1
+    name = None
+    while i < len(args) and args[i].startswith("-"):
+        token = args[i]
+        if token == "--":
+            i += 1
+            break
+        if token.startswith("-") and not token.startswith("--") and set(token[1:]) <= set("itd"):
+            i += 1
+            continue
+        end = option_end(args, i, RUN_VALUES, RUN_FLAGS)
+        if token.split("=", 1)[0] == "--name":
+            name = token.split("=", 1)[1] if "=" in token else args[i + 1]
+        i = end
+    if not name or i >= len(args):
+        return None
+    return {"command": command, "name": name, "image": args[i]}
+
+
+def discover(proc=Path("/proc"), uid=None):
+    uid = os.getuid() if uid is None else uid
+    if not proc.is_dir():
+        raise ValueError("Linux /proc is required; run this helper on the Podman host")
+    found = []
+    for entry in sorted(proc.iterdir()):
+        if not entry.name.isdigit():
+            continue
+        try:
+            if entry.stat().st_uid != uid:
+                continue
+            raw = (entry / "cmdline").read_bytes()
+            args = [os.fsdecode(part) for part in raw.rstrip(b"\0").split(b"\0")]
+            candidate = parse_invocation(args)
+            if candidate:
+                candidate.update(pid=int(entry.name), raw=raw)
+                found.append(candidate)
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        except ValueError as error:
+            print(f"Skipping PID {entry.name}: {error}", file=sys.stderr)
+    return found
+
+
+RUNTIME_ENV = {
+    "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "HOME", "PATH",
+    "CONTAINERS_CONF", "CONTAINERS_CONF_OVERRIDE", "CONTAINERS_STORAGE_CONF",
+    "CONTAINERS_CONF_MODULES", "CONTAINERS_POLICY", "CONTAINERS_REGISTRIES_CONF",
+    "REGISTRY_AUTH_FILE", "TMPDIR", "LD_LIBRARY_PATH",
+}
+
+
+def runtime_environment(raw):
+    # Only import engine configuration, not arbitrary credentials or SSH state.
+    env = os.environ.copy()
+    for key in RUNTIME_ENV:
+        env.pop(key, None)
+    for item in raw.split(b"\0"):
+        key, sep, value = item.partition(b"=")
+        if sep and os.fsdecode(key) in RUNTIME_ENV:
+            env[os.fsdecode(key)] = os.fsdecode(value)
+    return env
+
+
+def query(command, *args, **kwargs):
+    result = subprocess.run(command + list(args), stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, universal_newlines=True, timeout=15, env=kwargs.get("env"))
+    if result.returncode:
+        raise ValueError(result.stderr.strip() or "Podman command failed")
+    return result.stdout.strip()
+
+
+def session_context(candidate):
+    command = candidate["command"]
+    proc = Path("/proc") / str(candidate["pid"])
+    if proc.stat().st_uid != os.getuid() or (proc / "cmdline").read_bytes() != candidate["raw"]:
+        raise ValueError("Podman process changed; list sessions again")
+    # Reuse the originating installation and all recognized global arguments.
+    # crun's state lookup and module/runtime resolution depend on this environment,
+    # independently of Podman's --root and --runroot storage paths.
+    env = runtime_environment((proc / "environ").read_bytes())
+    if (proc / "cmdline").read_bytes() != candidate["raw"]:
+        raise ValueError("Podman process changed while reading its environment")
+    return command, env
+
+
+def inspect_session(candidate):
+    command, env = session_context(candidate)
+    records = json.loads(query(command, "inspect", "--type", "container", candidate["name"], env=env))
+    if len(records) != 1:
+        raise ValueError("expected one inspected container")
+    return records[0]
+
+
+def select_enabled(candidates, name=None, pid=None):
+    matches = []
+    for candidate in candidates:
+        if name is not None and candidate["name"] != name:
+            continue
+        if pid is not None and candidate["pid"] != pid:
+            continue
+        record = inspect_session(candidate)
+        if record.get("State", {}).get("Running") and record.get("Config", {}).get("Annotations", {}).get(SSH_AUTHORIZED_KEY_ANNOTATION):
+            matches.append(candidate)
+    if len(matches) != 1:
+        raise ValueError("found {} live SSH-enabled containers; expected exactly one".format(len(matches)))
+    return matches[0]
+
+
+def connect(candidate):
+    command, env = session_context(candidate)
+    if query(command, "info", "--format", "{{.Host.Security.Rootless}}", env=env) != "true":
+        raise ValueError("rootless Podman is required")
+    records = json.loads(query(command, "inspect", "--type", "container", candidate["name"], env=env))
+    if len(records) != 1 or not records[0]["State"]["Running"]:
+        raise ValueError("container is not running")
+    if not records[0].get("Config", {}).get("Annotations", {}).get(SSH_AUTHORIZED_KEY_ANNOTATION):
+        raise ValueError("container has no ssh.authorized_key annotation")
+    container_id = records[0]["Id"]
+    if query(command, "exec", container_id, "id", "-u", env=env) != str(os.getuid()):
+        raise ValueError("container UID does not match the host user")
+    if query(command, "exec", container_id, "id", "-g", env=env) != str(os.getgid()):
+        raise ValueError("container GID does not match the host user")
+    os.execve(command[0], command + ["exec", "-i", container_id,
+                                  "/usr/local/bin/hpc-dev-sshd"], env)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    # Python 3.6 has no add_subparsers(required=...) keyword.
+    sub = parser.add_subparsers(dest="action")
+    sub.required = True
+    sub.add_parser("list", help="list candidate sessions on this host")
+    select = sub.add_parser("connect", help="connect to an exact container name")
+    select.add_argument("container", nargs="?")
+    select.add_argument("--pid", type=int, help="disambiguate duplicate container names")
+    args = parser.parse_args()
+    try:
+        candidates = discover()
+        if args.action == "list":
+            print("PID\tCONTAINER\tIMAGE")
+            for candidate in candidates:
+                print(f"{candidate['pid']}\t{candidate['name']}\t{candidate['image']}")
+            return
+        selected = select_enabled(candidates, args.container, args.pid)
+        connect(selected)
+    except (ValueError, OSError, KeyError, subprocess.TimeoutExpired) as error:
+        parser.exit(1, f"container-ssh-proxy: {error}\n")
+
+
+if __name__ == "__main__":
+    main()

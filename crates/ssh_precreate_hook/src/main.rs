@@ -1,12 +1,16 @@
 use std::{
+    env,
+    ffi::{CStr, OsStr},
     fmt, fs,
     io::{self, Read, Seek, SeekFrom, Write},
+    mem::MaybeUninit,
     os::unix::{
+        ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-        process::ExitStatusExt,
     },
     path::{Path, PathBuf},
     process::{self, Command},
+    ptr,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -17,7 +21,6 @@ use sha2::{Digest, Sha256};
 const USER_RUNTIME_ROOT: &str = "/run/user";
 const STATE_DIR_NAME: &str = "sarus-hook";
 const AUTHORIZED_KEYS_NAME: &str = "authorized_keys";
-const IDENTITY_NAME: &str = "identity";
 const DESTINATION: &str = "/etc/ssh/hpc-dev-authorized_keys";
 const SSHD_CONFIG_NAME: &str = "sshd_config.podman";
 const SSHD_CONFIG_DESTINATION: &str = "/etc/ssh/sshd_config.podman";
@@ -27,6 +30,10 @@ const SSHD_BUNDLE_PREFIX: &str = "hpc-sshd";
 const SSHD_BUNDLE_DESTINATION: &str = "/usr/local/libexec/hpc-sshd";
 const SSHD_RUNTIME_NAME: &str = "hpc-dev-ssh";
 const SSHD_RUNTIME_DESTINATION: &str = "/run/hpc-dev-ssh";
+const CONTAINER_SSH_PROXY_NAME: &str = "container-ssh-proxy";
+const PROXY_INSTALL_ANNOTATION: &str = "ssh.proxy.install";
+const PROXY_MANAGED_HEADER: &[u8] =
+    b"#!/usr/bin/env python3\n# managed-by: performance-extensions\n";
 const DIRECTORY_MODE: u32 = 0o700;
 const BUNDLE_DIRECTORY_MODE: u32 = 0o755;
 const FILE_MODE: u32 = 0o600;
@@ -35,6 +42,7 @@ const EXECUTABLE_MODE: u32 = 0o755;
 const AUTHORIZED_KEY_ANNOTATION: &str = "ssh.authorized_key";
 const SSHD_CONFIG: &[u8] = include_bytes!("../assets/sshd_config.podman");
 const SSHD_LAUNCHER: &[u8] = include_bytes!("../assets/hpc-dev-sshd");
+const CONTAINER_SSH_PROXY: &[u8] = include_bytes!("../assets/container-ssh-proxy");
 const SSHD_BUNDLE: [(&str, &[u8]); 4] = [
     ("sshd", include_bytes!("../assets/sshd")),
     ("sshd-auth", include_bytes!("../assets/sshd-auth")),
@@ -85,6 +93,13 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProxyInstallPolicy {
+    Auto,
+    Required,
+    Never,
+}
+
 fn run() -> Result<()> {
     let mut config = read_stdin_json()?;
     let config_object = config.as_object_mut().ok_or_else(|| {
@@ -93,18 +108,13 @@ fn run() -> Result<()> {
             "OCI configuration must be a JSON object",
         )
     })?;
+    let proxy_install_policy = annotation_proxy_install_policy(config_object)?;
+    let authorized_key = annotation_authorized_key(config_object)?;
 
     let state = state_directory()?;
     let _lock = Lock::acquire(&state)?;
-    let authorized_keys = match annotation_authorized_key(config_object)? {
-        Some(key) => write_annotated_authorized_key(&state, &key)?,
-        None => {
-            let identity = ensure_identity(&state)?;
-            let authorized_keys = state.join(AUTHORIZED_KEYS_NAME);
-            write_authorized_keys(&identity, &authorized_keys)?;
-            authorized_keys
-        }
-    };
+    install_container_ssh_proxy(proxy_install_policy)?;
+    let authorized_keys = write_annotated_authorized_key(&state, &authorized_key)?;
     let (sshd_config, sshd_launcher, sshd_bundle) = ensure_sshd_assets(&state)?;
     let sshd_runtime = ensure_sshd_runtime(&state)?;
     add_ssh_mounts(
@@ -287,129 +297,330 @@ fn validate_directory(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn ensure_identity(state: &Path) -> Result<PathBuf> {
-    let identity = state.join(IDENTITY_NAME);
-    match fs::symlink_metadata(&identity) {
-        Ok(_) => validate_private_file(&identity, "private key")?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            generate_identity(state, &identity)?
-        }
-        Err(error) => {
-            return Err(Error::new(
-                ExitStatus::IoErr,
-                format!(
-                    "failed to inspect private key {}: {error}",
-                    identity.display()
-                ),
-            ));
-        }
+fn install_container_ssh_proxy(policy: ProxyInstallPolicy) -> Result<()> {
+    if policy == ProxyInstallPolicy::Never {
+        return Ok(());
     }
-    Ok(identity)
+
+    match ensure_container_ssh_proxy() {
+        Ok(_) => Ok(()),
+        Err(error) if policy == ProxyInstallPolicy::Auto => {
+            eprintln!(
+                "ssh_precreate_hook: warning: could not install {CONTAINER_SSH_PROXY_NAME}: {error}"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
-fn generate_identity(state: &Path, identity: &Path) -> Result<()> {
-    let work = state.join(format!(".prepare-{}-{}", process::id(), nonce()?));
-    fs::create_dir(&work).map_err(|error| {
-        Error::new(
-            ExitStatus::IoErr,
-            format!("failed to create SSH preparation directory: {error}"),
-        )
-    })?;
-    let generated = work.join(IDENTITY_NAME);
-    let result = Command::new("ssh-keygen")
-        .args([
-            "-q",
-            "-t",
-            "ed25519",
-            "-N",
-            "",
-            "-C",
-            "sarus-ssh-session",
-            "-f",
-        ])
-        .arg(&generated)
-        .status();
-    match result {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            let _ = fs::remove_dir_all(&work);
-            return Err(Error::new(
-                ExitStatus::Software,
-                format!("ssh-keygen failed with {status}"),
-            ));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let _ = fs::remove_dir_all(&work);
-            return Err(Error::new(
-                ExitStatus::Unavailable,
-                "ssh-keygen is required on the host",
-            ));
-        }
-        Err(error) => {
-            let _ = fs::remove_dir_all(&work);
-            return Err(Error::new(
-                ExitStatus::IoErr,
-                format!("failed to execute ssh-keygen: {error}"),
-            ));
-        }
-    }
-    fs::set_permissions(&generated, fs::Permissions::from_mode(FILE_MODE)).map_err(|error| {
-        Error::new(
-            ExitStatus::IoErr,
-            format!("failed to protect generated private key: {error}"),
-        )
-    })?;
-    validate_private_file(&generated, "generated private key")?;
-    fs::rename(&generated, identity).map_err(|error| {
-        Error::new(
-            ExitStatus::IoErr,
-            format!(
-                "failed to install private key {}: {error}",
-                identity.display()
-            ),
-        )
-    })?;
-    fs::remove_dir_all(&work).map_err(|error| {
-        Error::new(
-            ExitStatus::IoErr,
-            format!("failed to remove SSH preparation directory: {error}"),
-        )
-    })?;
-    validate_private_file(identity, "private key")
-}
-
-fn write_authorized_keys(identity: &Path, authorized_keys: &Path) -> Result<()> {
-    let output = Command::new("ssh-keygen")
-        .args(["-y", "-P", "", "-f"])
-        .arg(identity)
-        .output()
-        .map_err(|error| {
-            let status = if error.kind() == io::ErrorKind::NotFound {
-                ExitStatus::Unavailable
-            } else {
-                ExitStatus::IoErr
-            };
-            Error::new(status, format!("failed to execute ssh-keygen: {error}"))
-        })?;
-    if !output.status.success() {
+fn ensure_container_ssh_proxy() -> Result<PathBuf> {
+    let host_uid = state_owner_uid()?;
+    if host_uid == 0 {
         return Err(Error::new(
-            ExitStatus::Software,
+            ExitStatus::Config,
             format!(
-                "ssh-keygen failed while deriving authorized_keys: {}",
-                output
-                    .status
-                    .code()
-                    .unwrap_or_else(|| 128 + output.status.signal().unwrap_or(0))
+                "refusing to install {CONTAINER_SSH_PROXY_NAME} for host UID 0; use rootless Podman or set {PROXY_INSTALL_ANNOTATION}=never"
             ),
         ));
     }
 
-    write_authorized_keys_file(authorized_keys, &output.stdout)
+    let home = home_directory_for_uid(host_uid)?;
+    install_container_ssh_proxy_in(&home)
 }
 
-fn annotation_authorized_key(config: &Map<String, Value>) -> Result<Option<String>> {
+fn home_directory_for_uid(uid: u32) -> Result<PathBuf> {
+    match passwd_home_directory(uid)? {
+        Some(home) => validate_home_directory(home),
+        None => {
+            let home = env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+                Error::new(
+                    ExitStatus::Unavailable,
+                    format!(
+                        "cannot resolve a home directory for host UID {uid}; set {PROXY_INSTALL_ANNOTATION}=never or provide HOME"
+                    ),
+                )
+            })?;
+            validate_home_directory(home)
+        }
+    }
+}
+
+fn passwd_home_directory(uid: u32) -> Result<Option<PathBuf>> {
+    let configured_size = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let mut buffer_size = if configured_size > 0 {
+        configured_size as usize
+    } else {
+        16 * 1024
+    };
+    buffer_size = buffer_size.max(1024);
+
+    loop {
+        let mut passwd = MaybeUninit::<libc::passwd>::uninit();
+        let mut result = ptr::null_mut();
+        let mut buffer = vec![0_u8; buffer_size];
+        let status = unsafe {
+            libc::getpwuid_r(
+                uid,
+                passwd.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status == libc::ERANGE {
+            buffer_size = buffer_size.checked_mul(2).ok_or_else(|| {
+                Error::new(
+                    ExitStatus::Software,
+                    "password-database buffer size overflow",
+                )
+            })?;
+            if buffer_size > 1024 * 1024 {
+                return Err(Error::new(
+                    ExitStatus::Unavailable,
+                    "password-database entry exceeds 1 MiB",
+                ));
+            }
+            continue;
+        }
+        if status != 0 {
+            return Err(Error::new(
+                ExitStatus::IoErr,
+                format!(
+                    "failed to resolve host UID {uid}: {}",
+                    io::Error::from_raw_os_error(status)
+                ),
+            ));
+        }
+        if result.is_null() {
+            return Ok(None);
+        }
+
+        let passwd = unsafe { passwd.assume_init() };
+        if passwd.pw_dir.is_null() {
+            return Ok(None);
+        }
+        let bytes = unsafe { CStr::from_ptr(passwd.pw_dir) }.to_bytes();
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(PathBuf::from(OsStr::from_bytes(bytes))));
+    }
+}
+
+fn validate_home_directory(home: PathBuf) -> Result<PathBuf> {
+    if !home.is_absolute() {
+        return Err(Error::new(
+            ExitStatus::Config,
+            format!("user home must be absolute: {}", home.display()),
+        ));
+    }
+    validate_directory(&home, "user home")?;
+    Ok(home)
+}
+
+fn install_container_ssh_proxy_in(home: &Path) -> Result<PathBuf> {
+    validate_directory(home, "user home")?;
+    let local = home.join(".local");
+    ensure_user_directory(&local, ".local directory")?;
+    let bin = local.join("bin");
+    ensure_user_directory(&bin, ".local/bin directory")?;
+
+    let destination = bin.join(CONTAINER_SSH_PROXY_NAME);
+    let replace = match read_installed_proxy(&destination)? {
+        None => true,
+        Some(contents) if contents == CONTAINER_SSH_PROXY => {
+            fs::set_permissions(&destination, fs::Permissions::from_mode(EXECUTABLE_MODE))
+                .map_err(|error| {
+                    Error::new(
+                        ExitStatus::IoErr,
+                        format!(
+                            "failed to set permissions on {}: {error}",
+                            destination.display()
+                        ),
+                    )
+                })?;
+            false
+        }
+        Some(contents) if contents.starts_with(PROXY_MANAGED_HEADER) => true,
+        Some(_) => {
+            return Err(Error::new(
+                ExitStatus::Config,
+                format!(
+                    "{} exists but is not managed by performance-extensions; leaving it unchanged",
+                    destination.display()
+                ),
+            ));
+        }
+    };
+
+    if replace {
+        install_proxy_atomically(&bin, &destination)?;
+    }
+    Ok(destination)
+}
+
+fn ensure_user_directory(path: &Path, label: &str) -> Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => {
+            fs::set_permissions(path, fs::Permissions::from_mode(BUNDLE_DIRECTORY_MODE)).map_err(
+                |error| {
+                    Error::new(
+                        ExitStatus::IoErr,
+                        format!("failed to set permissions on {label}: {error}"),
+                    )
+                },
+            )?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(Error::new(
+                ExitStatus::IoErr,
+                format!("failed to create {label} {}: {error}", path.display()),
+            ));
+        }
+    }
+    validate_directory(path, label)
+}
+
+fn read_installed_proxy(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(Error::new(
+                ExitStatus::Config,
+                format!("{} must not be a symlink", path.display()),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(Error::new(
+                ExitStatus::IoErr,
+                format!("failed to inspect {}: {error}", path.display()),
+            ));
+        }
+    }
+
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            Error::new(
+                ExitStatus::IoErr,
+                format!("failed to open {}: {error}", path.display()),
+            )
+        })?;
+    validate_open_file(&file, path, CONTAINER_SSH_PROXY_NAME)?;
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents).map_err(|error| {
+        Error::new(
+            ExitStatus::IoErr,
+            format!("failed to read {}: {error}", path.display()),
+        )
+    })?;
+    Ok(Some(contents))
+}
+
+fn install_proxy_atomically(directory: &Path, destination: &Path) -> Result<()> {
+    let temporary = directory.join(format!(
+        ".{CONTAINER_SSH_PROXY_NAME}.{}-{}.tmp",
+        process::id(),
+        nonce()?
+    ));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(FILE_MODE)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&temporary)
+            .map_err(|error| {
+                Error::new(
+                    ExitStatus::IoErr,
+                    format!("failed to create temporary {CONTAINER_SSH_PROXY_NAME}: {error}"),
+                )
+            })?;
+        file.write_all(CONTAINER_SSH_PROXY).map_err(|error| {
+            Error::new(
+                ExitStatus::IoErr,
+                format!("failed to write {CONTAINER_SSH_PROXY_NAME}: {error}"),
+            )
+        })?;
+        file.set_permissions(fs::Permissions::from_mode(EXECUTABLE_MODE))
+            .map_err(|error| {
+                Error::new(
+                    ExitStatus::IoErr,
+                    format!("failed to make {CONTAINER_SSH_PROXY_NAME} executable: {error}"),
+                )
+            })?;
+        file.sync_all().map_err(|error| {
+            Error::new(
+                ExitStatus::IoErr,
+                format!("failed to sync {CONTAINER_SSH_PROXY_NAME}: {error}"),
+            )
+        })?;
+        drop(file);
+
+        fs::rename(&temporary, destination).map_err(|error| {
+            Error::new(
+                ExitStatus::IoErr,
+                format!("failed to install {}: {error}", destination.display()),
+            )
+        })?;
+        fs::File::open(directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                Error::new(
+                    ExitStatus::IoErr,
+                    format!("failed to sync {}: {error}", directory.display()),
+                )
+            })?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn annotation_proxy_install_policy(config: &Map<String, Value>) -> Result<ProxyInstallPolicy> {
     let Some(annotations) = config.get("annotations") else {
-        return Ok(None);
+        return Ok(ProxyInstallPolicy::Auto);
+    };
+    let annotations = annotations.as_object().ok_or_else(|| {
+        Error::new(
+            ExitStatus::DataErr,
+            "OCI configuration annotations must be an object",
+        )
+    })?;
+    let Some(policy) = annotations.get(PROXY_INSTALL_ANNOTATION) else {
+        return Ok(ProxyInstallPolicy::Auto);
+    };
+    let policy = policy.as_str().ok_or_else(|| {
+        Error::new(
+            ExitStatus::Config,
+            format!("{PROXY_INSTALL_ANNOTATION} must be a string"),
+        )
+    })?;
+    match policy {
+        "auto" => Ok(ProxyInstallPolicy::Auto),
+        "required" => Ok(ProxyInstallPolicy::Required),
+        "never" => Ok(ProxyInstallPolicy::Never),
+        _ => Err(Error::new(
+            ExitStatus::Config,
+            format!("{PROXY_INSTALL_ANNOTATION} must be one of auto, required, or never"),
+        )),
+    }
+}
+
+fn annotation_authorized_key(config: &Map<String, Value>) -> Result<String> {
+    let Some(annotations) = config.get("annotations") else {
+        return Err(Error::new(
+            ExitStatus::Config,
+            format!("missing required {AUTHORIZED_KEY_ANNOTATION} annotation"),
+        ));
     };
     let annotations = annotations.as_object().ok_or_else(|| {
         Error::new(
@@ -418,7 +629,10 @@ fn annotation_authorized_key(config: &Map<String, Value>) -> Result<Option<Strin
         )
     })?;
     let Some(key) = annotations.get(AUTHORIZED_KEY_ANNOTATION) else {
-        return Ok(None);
+        return Err(Error::new(
+            ExitStatus::Config,
+            format!("missing required {AUTHORIZED_KEY_ANNOTATION} annotation"),
+        ));
     };
     let key = key.as_str().ok_or_else(|| {
         Error::new(
@@ -439,7 +653,7 @@ fn annotation_authorized_key(config: &Map<String, Value>) -> Result<Option<Strin
             format!("{AUTHORIZED_KEY_ANNOTATION} must not be empty"),
         ));
     }
-    Ok(Some(key.to_owned()))
+    Ok(key.to_owned())
 }
 
 fn write_annotated_authorized_key(state: &Path, key: &str) -> Result<PathBuf> {
@@ -748,26 +962,6 @@ fn validate_not_symlink(path: &Path, label: &str) -> Result<()> {
     }
 }
 
-fn validate_private_file(path: &Path, label: &str) -> Result<()> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        Error::new(
-            ExitStatus::IoErr,
-            format!("failed to inspect {label}: {error}"),
-        )
-    })?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.uid() != effective_uid()
-        || metadata.nlink() != 1
-    {
-        return Err(Error::new(
-            ExitStatus::Config,
-            format!("{label} must be an unlinked regular file owned by the effective user"),
-        ));
-    }
-    Ok(())
-}
-
 fn validate_open_file(file: &fs::File, path: &Path, label: &str) -> Result<()> {
     let metadata = file.metadata().map_err(|error| {
         Error::new(
@@ -937,6 +1131,113 @@ fn nonce() -> Result<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn temp_home(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "ssh-precreate-hook-{label}-{}-{}",
+            process::id(),
+            nonce().unwrap()
+        ));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn defaults_to_auto_proxy_installation() {
+        let config = json!({});
+        assert_eq!(
+            annotation_proxy_install_policy(config.as_object().unwrap()).unwrap(),
+            ProxyInstallPolicy::Auto
+        );
+    }
+
+    #[test]
+    fn reads_proxy_installation_policy() {
+        for (value, expected) in [
+            ("auto", ProxyInstallPolicy::Auto),
+            ("required", ProxyInstallPolicy::Required),
+            ("never", ProxyInstallPolicy::Never),
+        ] {
+            let config = json!({
+                "annotations": { PROXY_INSTALL_ANNOTATION: value }
+            });
+            assert_eq!(
+                annotation_proxy_install_policy(config.as_object().unwrap()).unwrap(),
+                expected
+            );
+        }
+
+        let config = json!({
+            "annotations": { PROXY_INSTALL_ANNOTATION: "sometimes" }
+        });
+        assert!(annotation_proxy_install_policy(config.as_object().unwrap()).is_err());
+    }
+
+    #[test]
+    fn installs_and_reuses_the_embedded_proxy() {
+        let home = temp_home("proxy-install");
+        let first = install_container_ssh_proxy_in(&home).unwrap();
+        let second = install_container_ssh_proxy_in(&home).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(fs::read(&first).unwrap(), CONTAINER_SSH_PROXY);
+        assert_eq!(
+            fs::metadata(&first).unwrap().permissions().mode() & 0o777,
+            EXECUTABLE_MODE
+        );
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn upgrades_a_managed_proxy() {
+        let home = temp_home("proxy-upgrade");
+        let bin = home.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let proxy = bin.join(CONTAINER_SSH_PROXY_NAME);
+        fs::write(
+            &proxy,
+            b"#!/usr/bin/env python3\n# managed-by: performance-extensions\n# version: old\n",
+        )
+        .unwrap();
+
+        install_container_ssh_proxy_in(&home).unwrap();
+        assert_eq!(fs::read(&proxy).unwrap(), CONTAINER_SSH_PROXY);
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn preserves_an_unmanaged_proxy() {
+        let home = temp_home("proxy-unmanaged");
+        let bin = home.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let proxy = bin.join(CONTAINER_SSH_PROXY_NAME);
+        let original = b"#!/bin/sh\necho user-owned\n";
+        fs::write(&proxy, original).unwrap();
+
+        let error = install_container_ssh_proxy_in(&home).unwrap_err();
+        assert_eq!(error.exit_status(), ExitStatus::Config);
+        assert_eq!(fs::read(&proxy).unwrap(), original);
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_symlinked_proxy_destination() {
+        let home = temp_home("proxy-symlink");
+        let bin = home.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let target = home.join("target");
+        fs::write(&target, b"do not replace\n").unwrap();
+        symlink(&target, bin.join(CONTAINER_SSH_PROXY_NAME)).unwrap();
+
+        assert!(install_container_ssh_proxy_in(&home).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"do not replace\n");
+
+        fs::remove_dir_all(home).unwrap();
+    }
 
     #[test]
     fn replaces_an_equivalent_mount() {
@@ -1010,8 +1311,17 @@ mod tests {
         });
         assert_eq!(
             annotation_authorized_key(config.as_object().unwrap()).unwrap(),
-            Some("ssh-ed25519 AAAA example".to_owned())
+            "ssh-ed25519 AAAA example"
         );
+    }
+
+    #[test]
+    fn requires_an_authorized_key_annotation() {
+        let config = json!({ "annotations": {} });
+        let error = annotation_authorized_key(config.as_object().unwrap()).unwrap_err();
+
+        assert_eq!(error.exit_status(), ExitStatus::Config);
+        assert!(error.to_string().contains(AUTHORIZED_KEY_ANNOTATION));
     }
 
     #[test]
